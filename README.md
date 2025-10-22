@@ -18,10 +18,12 @@ git clone https://github.com/kevin-thankyou-lin/cpgen.git  # TODO update name
 
 git clone https://github.com/NVlabs/mimicgen.git
 git clone https://github.com/kevin-thankyou-lin/cpgen-envs.git
+git clone --branch enable-scale-setting-arena https://github.com/ARISE-Initiative/robosuite.git  # this branch for the 'Wide' envs
 
 pip install -e mimicgen
 pip install -e cpgen_envs
 pip install -e cpgen
+pip install -e robosuite
 
 # manually clone curobo
 # see https://curobo.org/get_started/1_install_instructions.html
