@@ -59,11 +59,14 @@ python scripts/playback_dataset.py --dataset <path/to/hdf5> --use-actions --vide
 
 
 # Generate data
-```
-MUJOCO_GL=egl python demo_aug/generate.py --cfg.demo-path datasets/source/square.hdf5 --cfg.env-name Square_D1
 
-MUJOCO_GL=egl python demo_aug/generate.py --cfg.demo-path datasets/source/square.hdf5 --cfg.env-name SquareWide
+For this example, please use the source datasets for the square task from the above [download generated datasets](https://github.com/kevin-thankyou-lin/cpgen/edit/main/README.md#download-source-datasets).
 ```
+MUJOCO_GL=egl python demo_aug/generate.py --cfg.demo-path src/source/square.hdf5 --cfg.env-name Square_D1
+
+MUJOCO_GL=egl python demo_aug/generate.py --cfg.demo-path src/source/square.hdf5 --cfg.env-name SquareWide
+```
+
 
 ### Data-gen behavior fixing
 
