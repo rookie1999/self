@@ -49,6 +49,7 @@ def set_body_pose(
 
 def update_fixed_joint_objects_in_xml(model: MjModel, xml_string: str) -> str:
     """
+    将当前物理引擎内存中（MjModel）那些没有关节（Fixed Joint）的物体的最新位置，反向写入到 XML 字符串中。
     Update the poses of all bodies with *fixed joints* in the XML string,
     to match the pose of the corresponding bodies in the model.
 

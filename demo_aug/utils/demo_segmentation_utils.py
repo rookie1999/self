@@ -424,6 +424,9 @@ def create_constraint(
         "name": label,
         "obj_names": [obj for obj in [obj1, obj2] if not obj.startswith("gripper0_")],
         "timesteps": list(range(time_range[0], time_range[1])),
+        # 设置物体的默认关键点
+        # 如果 obj1 不是机器人（是物体），就给 obj1 赋默认关键点。
+        # 否则（obj1 是机器人），说明 obj2 是物体，给 obj2 赋默认关键点。
         "keypoints_obj_frame_annotation": {obj1: DEFAULT_OBJ_KEYPOINTS}
         if not obj1.startswith("gripper0_")
         else {obj2: DEFAULT_OBJ_KEYPOINTS},
@@ -436,16 +439,29 @@ def create_constraint(
 
     # Decide constraint type and add additional fields
     if "gripper0" in obj1 or "gripper0" in obj2:
+        # 如果两个实体中有一个名字包含 "gripper0"，说明这是机器人和物体的互动。
+        # 标记类型为 "robot-object"（通常是抓取）。
+        # 因为涉及机器人，所以需要填入机器人的关键点数据（之前获取的 robot_keypoints）。
+        # 抓取阶段通常不需要显式定义“父子挂载”关系字典（或者在后续逻辑处理），这里设为 None。
         constraint["constraint_type"] = "robot-object"
         constraint["keypoints_robot_link_frame_annotation"] = robot_keypoints
         # Not used for robot-obj, so leave obj_to_parent_attachment_frame unset (or None)
         constraint["obj_to_parent_attachment_frame"] = None
     else:
+        # 如果两个都不是机器人（例如 "Cube" 和 "Peg"），标记类型为 "object-object"。
+        # 如果是物体对物体，代码假设 obj1 是正在被移动的物体（例如拿着 Cube 去插 Peg）。
+        # 所以它设置 obj1 的父坐标系为 "gripper0_right_eef"（机器人右手）。这意味着告诉系统：“此时 Cube 是焊在机器人手上的”。
+        # 物体对物体的约束关注的是两个物体的相对位置，不需要直接关注机器人本身的连杆关键点，设为 None。
         constraint["constraint_type"] = "object-object"
         constraint["obj_to_parent_attachment_frame"] = {obj1: "gripper0_right_eef"}
         # Not used for object-object, so leave keypoints_robot_link_frame_annotation unset (or None)
         constraint["keypoints_robot_link_frame_annotation"] = None
 
+    # 这一段是硬编码的策略（Heuristics），定义动作做完之后的动作。
+    # 如果是抓取（Robot-Object）：抓完之后，执行两次 "lift"（提升）动作。
+    # 如果是放置/组装（Object-Object）：
+    #     "open_gripper"：先松开爪子（放下东西）。
+    #     "lift", "lift"：然后抬起手离开。
     if constraint["constraint_type"] == "robot-object":
         constraint["post_constraint_behavior"] = [
             "lift",

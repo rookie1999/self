@@ -146,3 +146,8 @@ scripts/dataset/process_dataset.sh
 
 policy_checkpoints/
 datasets/
+
+
+stable-diffusion-v1-5/*
+
+updated_xml.xml

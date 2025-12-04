@@ -78,6 +78,7 @@ def generate_videos_from_hdf5(cfg: Config) -> None:
                         frame = dataset[i]
 
                         # Add time index to the frame if show_time_idx is True
+                        # 如果配置要求显示时间戳，就调用辅助函数 add_time_index。
                         if cfg.show_time_idx:
                             frame = add_time_index(frame, i)
 
@@ -89,8 +90,8 @@ def generate_videos_from_hdf5(cfg: Config) -> None:
 
 def add_time_index(frame: Any, time_idx: int) -> Any:
     """
+    接收一张图片和一个数字（时间步），然后把这个数字作为水印（例如 "Time: 50"）画在图片的左上角，最后把处理后的图片返还回去。
     Add time index to the image frame.
-
     Args:
         frame (Any): Image frame, must be a PIL Image.
         time_idx (int): Time index.
