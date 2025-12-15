@@ -27,6 +27,67 @@ from scipy.spatial.transform import Rotation as R
 _EPS = np.finfo(float).eps * 4.0
 
 
+def get_intrinsics_from_fov(fov_degrees: float, image_height: int, image_width: int) -> np.ndarray:
+    """
+    Calculate camera intrinsic matrix from vertical field of view.
+    Assuming square pixels and principal point at image center.
+    """
+    # fov is vertical field of view in degrees
+    # f_y = (H / 2) / tan(fov / 2)
+    # MuJoCo fovy is in degrees
+    f = 0.5 * image_height / np.tan(fov_degrees * np.pi / 360)
+
+    # K = [[fx, 0, cx],
+    #      [0, fy, cy],
+    #      [0,  0,  1]]
+    K = np.array([
+        [f, 0, image_width / 2.0],
+        [0, f, image_height / 2.0],
+        [0, 0, 1.0]
+    ])
+    return K
+
+def project_world_to_pixel(point_world, extrinsics, intrinsics):
+    """
+    point_world: [3]
+    extrinsics: [4, 4] (World -> Camera 变换矩阵, 包含旋转和平移)
+    intrinsics: [3, 3]
+    """
+    # 1. World -> Camera
+    # 变成齐次坐标 [x, y, z, 1]
+    pt_h = np.append(point_world, 1.0)
+    pt_cam = np.dot(np.linalg.inv(extrinsics), pt_h)  # 注意外参的定义方向，这里假设 extrinsics 是 Cam->World，所以取逆
+    # 如果 extrinsics 本身就是 World->Cam (如 OpenCV 风格)，则直接 dot
+
+    # 注意 Mujoco 相机坐标系通常是 -Z forward, +Y up，或者 -Z forward, -Y down (OpenCV)
+    # 可能需要额外的轴变换，视你的 extrinsic 获取方式而定
+
+    # 2. Camera -> Pixel (透视除法)
+    z = pt_cam[2]
+    u = (pt_cam[0] * intrinsics[0, 0] / z) + intrinsics[0, 2]
+    v = (pt_cam[1] * intrinsics[1, 1] / z) + intrinsics[1, 2]
+
+    return int(u), int(v)
+
+
+def deproject_pixel_to_world(u, v, z, extrinsics, intrinsics):
+    """
+    u, v: pixel coordinates
+    z: depth value (meters)
+    """
+    # 1. Pixel -> Camera
+    x_cam = (u - intrinsics[0, 2]) * z / intrinsics[0, 0]
+    y_cam = (v - intrinsics[1, 2]) * z / intrinsics[1, 1]
+    z_cam = z
+
+    pt_cam = np.array([x_cam, y_cam, z_cam, 1.0])
+
+    # 2. Camera -> World
+    # 假设 extrinsics 是 Camera -> World 的变换矩阵
+    pt_world = np.dot(extrinsics, pt_cam)
+
+    return pt_world[:3]
+
 def make_pose(translation, rotation):
     """
     Makes a homogeneous pose matrix from a translation vector and a rotation matrix.

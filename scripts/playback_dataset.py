@@ -271,7 +271,7 @@ def playback_dataset(args):
         ObsUtils.initialize_obs_utils_with_obs_specs(obs_modality_specs=dummy_spec)
 
         env_meta = FileUtils.get_env_metadata_from_dataset(dataset_path=args.dataset)
-        env_meta["env_kwargs"]["controller_configs"] = load_composite_controller_config(controller="../demo_aug/configs/robosuite/panda_ik.json")
+        env_meta["env_kwargs"]["controller_configs"] = load_composite_controller_config(controller="demo_aug/configs/robosuite/panda_ik.json")
         if env_meta["env_name"] is None:
             env_meta["env_name"] = env_meta["env_kwargs"]["env_name"]
         if "env_name" in env_meta["env_kwargs"]:  # has key

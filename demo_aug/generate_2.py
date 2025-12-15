@@ -9,6 +9,9 @@ import logging
 import os
 from types import SimpleNamespace
 
+from PIL import Image, ImageDraw
+
+from demo_aug.utils import camera_utils
 from demo_aug.utils.demo_segmentation_utils import (
     create_constraint,
     decompose_trajectory,
@@ -17,6 +20,7 @@ from demo_aug.utils.demo_segmentation_utils import (
     run_llm_success_segmentation,
     unparse_interactions,
 )
+from demo_aug.visual_matching.semantic_tracker import SDFeatureMatcher
 
 os.environ["MUJOCO_GL"] = "egl"
 
@@ -91,6 +95,23 @@ from demo_aug.utils.xml_utils import (
     update_xml_with_mjmodel,
 )
 
+# ==============================================================================
+# [Fix 1] Monkey Patch修复 AssertionError: np.all(depth_map >= 0.0) ...
+# ==============================================================================
+def robust_get_real_depth_map(self, depth_map):
+    # 强制将深度图限制在 [0, 1] 之间，防止浮点数误差导致的断言失败
+    depth_map = np.clip(depth_map, 0.0, 1.0)
+
+    # Robomimic 原始逻辑: 将归一化深度转为真实米单位
+    # near / (1.0 - depth_map * (1.0 - near / far))
+    sim = self.env.sim
+    extent = sim.model.stat.extent
+    far = sim.model.vis.map.zfar * extent
+    near = sim.model.vis.map.znear * extent
+    return near / (1.0 - depth_map * (1.0 - near / far))
+
+# 覆盖原类的方法
+EnvRobosuite.get_real_depth_map = robust_get_real_depth_map
 
 def set_seed(seed: int) -> None:
     random.seed(seed)  # Python's random module
@@ -1190,14 +1211,13 @@ class ConstraintGenerator:
         return constraint_sequences
 
     def _complete_constraint(
-        self,
-        constraint: Constraint,
-        demo: Demo,
-        env: CPEnv,
-        target_env: Optional[CPEnv] = None,
+            self,
+            constraint: Constraint,
+            demo: Demo,
+            env: CPEnv,
+            target_env: Optional[CPEnv] = None,
     ) -> Constraint:
         """
-        启动物理仿真器，时光倒流回到演示发生的每一个时刻，精确计算机器人、物体之间的相对位置关系，并将所有几何信息打包填入 Constraint 对象中。
         Complete the constraint datastructure using additional information from the environment and source demo.
         """
         timesteps = constraint.timesteps
@@ -1208,24 +1228,21 @@ class ConstraintGenerator:
             constraint.keypoints_robot_link_frame_annotation
         )
         keypoints_obj_frame = copy.deepcopy(constraint.keypoints_obj_frame_annotation)
-        src_obj_pose: Dict[str, np.ndarray] = defaultdict(list)  # 物体在每一帧的位姿
-        src_obs: Dict[str, List[Dict[str, np.ndarray]]] = defaultdict(list)  # 每一帧的观测数据
-        src_obj_geoms_size: Dict[str, List[Dict[str, np.ndarray]]] = defaultdict(list)  # 物体的几何尺寸（用于碰撞检测）
+        src_obj_pose: Dict[str, np.ndarray] = defaultdict(list)
+        src_obs: Dict[str, List[Dict[str, np.ndarray]]] = defaultdict(list)
+        src_obj_geoms_size: Dict[str, List[Dict[str, np.ndarray]]] = defaultdict(list)
         src_obj_transform: Dict[str, Union[np.ndarray, Callable]] = {}
 
+        # 新增：用于存储相机参数
+        src_camera_params = []
+
         if (
-            demo.env_args is not None
-            and demo.env_args.get("env_version", None) is not None
-            and demo.env_args["env_version"] == robosuite.__version__
+                demo.env_args is not None
+                and demo.env_args.get("env_version", None) is not None
+                and demo.env_args["env_version"] == robosuite.__version__
         ):
-            # 不仅重置状态，还重新加载 XML 模型文件
             env.env.reset_to({"states": demo.states[0], "model": demo.model_file})
-            # TODO: maybe do sync_fixed_joint_objects_in_mjmodel except inverse i.e. get values from xml and update mjmodel
-            # unfortunately, resetting model file is really slow;
-            # +1 reason for using original source demo + annotations
-            # only reset-to model file if robosuite version matches env args; else may fail
-            # some fixed objects' poses are only reflected in the model file;
-            # TODO: have a better way to specify fixed objects' locations, currently specific to robosuite
+
         if constraint_type == "robot-object":
             # Expand robot keypoints across time
             for robot_frame, keypoints_t_kpts_xyz in keypoints_robot_link_frame.items():
@@ -1241,8 +1258,8 @@ class ConstraintGenerator:
                 env.env.reset_to({"states": demo.states[timestep]})
                 object_name = object_names[0]
                 for (
-                    robot_link,
-                    keypoints_robot_frame,
+                        robot_link,
+                        keypoints_robot_frame,
                 ) in keypoints_robot_link_frame.items():
                     for keypoint in keypoints_robot_frame[timestep_idx]:
                         keypt_pose_src_frame = np.eye(4)
@@ -1301,15 +1318,69 @@ class ConstraintGenerator:
         src_action = np.array([demo.actions[t] for t in timesteps])
         src_gripper_action = src_action[:, -1:]
 
+        # 定义需要保存的观测数据 key，新增图像和深度图
+        copy_obs = ["robot0_gripper_qpos", "robot0_eef_pos", "robot0_eef_quat_site", "agentview_image",
+                    "agentview_depth"]
+
         for t in timesteps:
             obs = env.env.reset_to({"states": demo.states[t]})
             for obj_name in object_names:
                 src_obj_pose[obj_name].append(env.get_obj_pose(obj_name))
                 src_obj_transform[obj_name] = env.get_obj_geom_transform(obj_name)
                 src_obj_geoms_size[obj_name].append(env.get_obj_geoms_size(obj_name))
-            copy_obs = ["robot0_gripper_qpos", "robot0_eef_pos", "robot0_eef_quat_site"]
+
             for obs_name in copy_obs:
-                src_obs[obs_name].append(obs[obs_name])
+                if obs_name in obs:
+                    val = obs[obs_name]
+                    # 如果是图像，确保格式正确以节省空间
+                    if "image" in obs_name and val.dtype != np.uint8 and np.max(val) <= 1.0:
+                        val = (val * 255).astype(np.uint8)
+                    src_obs[obs_name].append(val)
+
+            # --- 获取并保存相机参数 (Mujoco) ---
+            # 注意：此处假设使用的是 agentview 相机，如果使用其他相机请修改 cam_name
+            try:
+                cam_name = "agentview"
+                sim = env.env.env.sim
+                cam_id = sim.model.camera_name2id(cam_name)
+
+                # 获取外参 (World -> Camera 变换矩阵)
+                cam_pos = sim.data.cam_xpos[cam_id]
+                cam_mat = sim.data.cam_xmat[cam_id].reshape(3, 3)
+
+                # --- [关键修复] 坐标系转换 ---
+                # MuJoCo (OpenGL) 是 -Z 前, +Y 上
+                # OpenCV 是 +Z 前, +Y 下
+                # 需要绕 X 轴旋转 180 度进行对齐
+                # R_gl_to_cv = np.array([
+                #     [1, 0, 0],
+                #     [0, -1, 0],
+                #     [0, 0, -1]
+                # ])
+                # # 修正后的旋转矩阵
+                # cam_mat = cam_mat @ R_gl_to_cv
+
+                extrinsics = np.eye(4)
+                extrinsics[:3, :3] = cam_mat
+                extrinsics[:3, 3] = cam_pos
+
+                # 获取内参 (基于 FOV 和 图像尺寸)
+                # 假设图像尺寸为 128x128，如果不是请从 obs 获取
+                h, w = 128, 128
+                if "agentview_image" in obs:
+                    h, w = obs["agentview_image"].shape[:2]
+                fovy = sim.model.cam_fovy[cam_id]
+                # 使用 camera_utils 计算内参，或者手动计算
+                intrinsics = camera_utils.get_intrinsics_from_fov(fovy, h, w)
+
+                src_camera_params.append({
+                    "extrinsics": extrinsics,
+                    "intrinsics": intrinsics
+                })
+            except Exception as e:
+                # 防止因相机不存在导致崩溃，记录错误但不中断
+                logging.warning(f"Failed to extract camera params: {e}")
+                src_camera_params.append(None)
 
         src_state = np.array([demo.states[t] for t in timesteps])
 
@@ -1318,6 +1389,9 @@ class ConstraintGenerator:
             obj_name: np.array(obj_pose) for obj_name, obj_pose in src_obj_pose.items()
         }
         constraint.src_obs = src_obs
+        # 保存相机参数到 src_obs 中方便后续调用
+        constraint.src_obs["camera_params"] = src_camera_params
+
         constraint.src_obj_transform = src_obj_transform
         constraint.src_obj_geoms_size = src_obj_geoms_size
         constraint.src_action = src_action
@@ -2572,6 +2646,8 @@ class CPPolicy:
         verbose: bool = False,
         original_xml: str = None,
         ignore_scaling: bool = False,
+        sd_matcher: Optional[SDFeatureMatcher] = None,
+        use_semantic_matching: bool = False,
     ):
         self.motion_planner = motion_planner  # 保存运动规划器。这是用于计算从点 A 到点 B 无碰撞路径的核心工具
         self.eef_interp_mink_motion_planer = eef_interp_mink_motion_planer  # 保存辅助规划器（Mink）。这是一个特定的基于 Mink 库的规划器，通常用于更精细的逆运动学（IK）求解或简单的插值运动。
@@ -2602,6 +2678,8 @@ class CPPolicy:
         self.verbose: bool = verbose
         self.env = env  # used to update robot configuration for attachments
         self.original_xml = original_xml  # b/c get_xml() is overridden  # 保存原始 XML 模型字符串
+        self.sd_matcher = sd_matcher
+        self.use_semantic_matching = use_semantic_matching
 
     def reset(self):
         """Reset the policy to the first constraint."""
@@ -2980,56 +3058,48 @@ class CPPolicy:
         )
 
     def solve_constraint(
-        self,
-        constraint: Constraint,
-        obs: Dict[str, Any],
-        dummy_actions: bool = False,
-        copy_constraint_actions: bool = True,
-        ik_type: Literal["kpts_to_robot_q", "kpts_to_eef_to_q"] = "kpts_to_eef_to_q",
-        fallback_to_kpts_to_robot_q: bool = True,
-        solve_first_n_steps: Optional[List[int]] = None,
-        # currently, no optimization for kpts_to_eef
+            self,
+            constraint: Constraint,
+            obs: Dict[str, Any],
+            dummy_actions: bool = False,
+            copy_constraint_actions: bool = True,
+            ik_type: Literal["kpts_to_robot_q", "kpts_to_eef_to_q"] = "kpts_to_eef_to_q",
+            fallback_to_kpts_to_robot_q: bool = True,
+            solve_first_n_steps: Optional[List[int]] = None,
+            # currently, no optimization for kpts_to_eef
     ) -> PlanningResult:
         """Generate a plan based on the updated constraint info.
-        给定一个约束和当前环境状态，请计算出连续的机器人动作，满足该约束。
         Args:
-            dummy_actions: 调试用，是否生成假动作
-            copy_constraint_actions: bool = True, # 策略：是否直接抄演示的动作（作为初始猜测）
             solve_first_n_steps: first n steps for solve constraint for.
                 Defaults to None, meaning all steps. Useful if only solving for e.g. first step.
             ik_type: type of IK solver to use.
-                - kpts_to_robot_q: [single stage] 直接计算关节。solve IK directly from keypoints to robot q.
-                - kpts_to_eef_to_q: [two stage] 先算手，再计算关节。solve IK from keypoints to eef and then from eef to robot q.
+                - kpts_to_robot_q: [single stage] solve IK directly from keypoints to robot q.
+                - kpts_to_eef_to_q: [two stage] solve IK from keypoints to eef and then from eef to robot q.
                     In practice, currently, doing eef to q directly. TODO(klin): add kpts to eef.
-            fallback_to_kpts_to_robot_q: 备选方案：如果两步走失败了，是否尝试一步走。if ik_type="kpts_to_eef_to_q" fails, fallback to "kpts_to_robot_q".
+            fallback_to_kpts_to_robot_q: if ik_type="kpts_to_eef_to_q" fails, fallback to "kpts_to_robot_q".
         """
         # Implement the logic for solving the constraint and generating a plan
         if dummy_actions:
             # stay at the current eef pose
-            # 生成一堆静止不动的假动作用于测试
             actions = np.zeros((30, 7))
             target_pos = obs["robot0_eef_pos"]
-            actions[:, :3] = target_pos  # 全部维持一个位置
+            actions[:, :3] = target_pos
             target_quat_xyzw = obs["robot0_eef_quat_site"]
             target_axis_angle = quat2axisangle(target_quat_xyzw)
-            actions[:, 3:6] = target_axis_angle  # 全部维持一个角度
+            actions[:, 3:6] = target_axis_angle
             DUMMY_GRIPPER_ACTION = 0.1
-            actions[:, 6] = DUMMY_GRIPPER_ACTION  # gripper action，全部维持一个夹爪开合程度
+            actions[:, 6] = DUMMY_GRIPPER_ACTION  # gripper action
             actions = actions  # + np.random.normal(0, 0.1, actions.shape)
 
         if copy_constraint_actions:
-            # 以原始演示（Demo）中的动作作为求解器的初始猜测（Initial Guess）
             actions = constraint.src_action
 
-        # 为了防止调试用的可视化操作破坏真实的仿真状态
         if self.viz_robot_kpts:
             # record env's current state
             state = self.env.env.get_state()
-            # 我们只关心动态数据（位置/速度）。XML 模型是静态的，不需要保存，带着它只会浪费内存和拖慢速度。
             state.pop("model")
 
         # use the current gripper obj transform to attach the object to the gripper
-        # 更新机器人模型和机械手模型
         self._update_robot_configuration(
             self.robot_configuration,
             eef_configuration=self.eef_configuration,
@@ -3038,19 +3108,13 @@ class CPPolicy:
             constraint=constraint,
         )
 
-        qs = []  # 存放计算出来的关节角度轨迹
-        actions = []  # 存放转换后的笛卡尔空间动作。assume action is eef_link_frame
+        qs = []
+        actions = []  # assume action is eef_link_frame
         # let's use the original pose and get the updated pose for now?
 
         # solve optimization problem to get actions
-        # 获取机器人当前时刻的关节角度。
         prev_q = self.robot_configuration.q[self.robot_configuration.robot_idxs]
-        # two actuated objects case --- can directly use their original poses to get keypoints
-        # one actuated object (either arm or object) case: use the non-actuated object as the anchor
-        #   if arm: the optimize hand-pose + gripper config first
-        #   if object: optimize object pose, then set the hand+gripper pose accordingly -- the key is knowing what to optimize in robot_configuration
-        #       in both cases, need to 1) detect/remove joint between object and robot 2) optimize over the pose
-        #       simplification --- can always optimize over robot eef pose (and optionally gripper qpos) for both arm/object being actuated I believe, until doing in hand manipulation
+
         obs["env"] = self.env
         X_obj0_transf, X_obj1_transf, X_eef_transf = None, None, None
         X_obj0_transf, X_obj1_transf, X_eef_transf = find_best_transform(
@@ -3062,8 +3126,9 @@ class CPPolicy:
             else len(constraint.timesteps)
         )
         assert (
-            solve_first_n_steps <= len(constraint.timesteps)
+                solve_first_n_steps <= len(constraint.timesteps)
         ), "constraint_steps should be less than or equal to the number of timesteps in the constraint"
+
         for t_idx in range(solve_first_n_steps):
             # # how to add in symmetry here? if doing discree option per symmetry, would get exponential explosion
             if constraint.constraint_type == "robot-object":
@@ -3088,18 +3153,19 @@ class CPPolicy:
                 )
                 # Scale the original keypoints to the current object's scale
                 P_obj_target = (
-                    constraint.keypoints_obj_frame[task_relev_obj][t_idx] * scale_factor
+                        constraint.keypoints_obj_frame[task_relev_obj][t_idx] * scale_factor
                 )
                 P_W_target = transform_keypoints(
                     P_obj_target, obs[f"{constraint.obj_names[0]}_pose"] @ X_obj0_transf
                 )[:, :3]
+
             elif constraint.constraint_type == "object-object":
                 # only keep keypoints attached to the kinematically 'actuated' object
                 link_to_kpts = {
                     link_name: keypoints[t_idx]
                     for link_name, keypoints in constraint.keypoints_obj_frame.items()
                     if link_name in constraint.obj_to_parent_attachment_frame
-                    and constraint.obj_to_parent_attachment_frame[link_name] is not None
+                       and constraint.obj_to_parent_attachment_frame[link_name] is not None
                 }
                 # get object keypoints in world frame: will be used in optimization q* = argmin_q ||P_W_goal - P_W_robot_kp(q)||^2
                 P_obj_target = np.array(
@@ -3109,11 +3175,150 @@ class CPPolicy:
                     P_obj_target, obs[f"{constraint.obj_names[1]}_pose"] @ X_obj1_transf
                 )[:, :3]  # s
 
-                use_weld_heuristic_action: bool = True
+                use_weld_heuristic_action = True
                 if use_weld_heuristic_action:
                     constraint.src_gripper_action[t_idx] = (
                         1  # hack for now to test if we needed to match actions rather than states
                     )
+
+            z_val = None
+            if self.use_semantic_matching and self.sd_matcher is not None:
+                has_src_img = "agentview_image" in constraint.src_obs and len(
+                    constraint.src_obs["agentview_image"]) > t_idx
+                has_tgt_img = "agentview_image" in obs
+                has_tgt_depth = "agentview_depth" in obs
+                has_cam = "camera_params" in constraint.src_obs and constraint.src_obs["camera_params"][
+                    t_idx] is not None
+                if has_src_img and has_tgt_img and has_tgt_depth and has_cam:
+                    try:
+                        src_img_np = constraint.src_obs["agentview_image"][t_idx]
+                        tgt_img_np = obs["agentview_image"]
+                        if tgt_img_np.dtype in [np.float32, np.float64]:
+                            tgt_img_np = (tgt_img_np * 255).astype(np.uint8)
+
+                        # [关键修改] 兼容 RGB (3通道) 和 RGBA (4通道)
+                        # 只要有图，我们就只取前3个通道，确保进入逻辑
+                        if src_img_np.ndim == 3 and src_img_np.shape[-1] >= 3:
+                            if src_img_np.ndim == 3 and src_img_np.shape[0] == 3:
+                                src_img_np = np.transpose(src_img_np, (1, 2, 0))
+                            if tgt_img_np.ndim == 3 and tgt_img_np.shape[0] == 3:
+                                tgt_img_np = np.transpose(tgt_img_np, (1, 2, 0))
+                            src_img = Image.fromarray(src_img_np[..., :3])  # 强制取 RGB
+                            tgt_img = Image.fromarray(tgt_img_np[..., :3])
+                            # 2. 获取源关键点的 3D 坐标
+                            if constraint.constraint_type == "robot-object":
+                                task_obj = constraint.obj_names[0]
+                                kpt_local = constraint.keypoints_obj_frame[task_obj][t_idx][0]
+                                src_pose = constraint.src_obj_pose[task_obj][t_idx]
+                                src_kpt_world = src_pose[:3, :3] @ kpt_local + src_pose[:3, 3]
+                            else:
+                                task_obj = constraint.obj_names[1]
+                                kpt_local = constraint.keypoints_obj_frame[task_obj][t_idx][0]
+                                src_pose = constraint.src_obj_pose[task_obj][t_idx]
+                                src_kpt_world = src_pose[:3, :3] @ kpt_local + src_pose[:3, 3]
+
+                            # 3. 投影到源图像平面
+                            src_cam_params = constraint.src_obs["camera_params"][t_idx]
+                            u_src, v_src = camera_utils.project_world_to_pixel(
+                                src_kpt_world,
+                                src_cam_params["extrinsics"],
+                                src_cam_params["intrinsics"]
+                            )
+
+                            # 4. 执行 SD 特征匹配
+                            matched_points = self.sd_matcher.match_points(src_img, tgt_img, [[u_src, v_src]])
+                            u_tgt, v_tgt = matched_points[0]
+
+                            if self.verbose:
+                                logging.info(f"SD Matching: Src({u_src}, {v_src}) -> Tgt({u_tgt}, {v_tgt})")
+
+
+                            # 5. 反投影回 3D 空间
+                            tgt_depth_map = obs["agentview_depth"]
+                            curr_cam_id = self.env.env.env.sim.model.camera_name2id("agentview")
+                            curr_cam_pos = self.env.env.env.sim.data.cam_xpos[curr_cam_id]
+                            curr_cam_mat = self.env.env.env.sim.data.cam_xmat[curr_cam_id].reshape(3, 3)
+
+                            # 坐标系转换
+                            R_gl_to_cv = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
+                            curr_cam_mat_cv = curr_cam_mat @ R_gl_to_cv
+
+                            tgt_extrinsics = np.eye(4)
+                            tgt_extrinsics[:3, :3] = curr_cam_mat_cv
+                            tgt_extrinsics[:3, 3] = curr_cam_pos
+                            tgt_intrinsics = src_cam_params["intrinsics"]
+
+                            h, w = tgt_depth_map.shape[:2]
+                            # 边界保护
+                            u_tgt = np.clip(u_tgt, 0, w - 1)
+                            v_tgt = np.clip(v_tgt, 0, h - 1)
+
+                            tgt_depth_map_2d = tgt_depth_map.squeeze()
+                            z_val = tgt_depth_map_2d[v_tgt, u_tgt]
+                            logging.info(f"Depth value at match: {z_val}")
+                            z_val = float(np.array(z_val).flatten()[0])
+
+                            if z_val > 0.1 and z_val < 5.0:
+                                P_W_target_semantic = camera_utils.deproject_pixel_to_world(
+                                    u_tgt, v_tgt, z_val,
+                                    tgt_extrinsics,
+                                    tgt_intrinsics
+                                )
+                                delta = P_W_target_semantic - P_W_target[0]
+                                P_W_target = P_W_target + delta
+
+                            # --- 可视化 ---
+                            if True:
+                                try:
+                                    # 局部引用，避免影响全局设置，且强制使用非交互式后端防报错
+                                    import matplotlib
+                                    matplotlib.use('Agg')
+                                    import matplotlib.pyplot as plt
+
+                                    # 1. 准备保存路径
+                                    save_root = os.path.join(get_save_dir(), "vis")
+
+                                    os.makedirs(save_root, exist_ok=True)
+
+                                    # 2. 创建画布 (1行2列)
+                                    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+
+                                    # 3. 绘制源图 (Source) - 左图
+                                    axes[0].imshow(src_img)
+                                    axes[0].set_title(f"Source Demo (Step {t_idx})")
+                                    # 绘制红色十字标记
+                                    axes[0].plot(u_src, v_src, marker='+', color='red', markersize=15, markeredgewidth=2, label='Keypoint')
+                                    axes[0].legend(loc='upper right')
+                                    axes[0].axis('off') # 关闭坐标轴刻度，更美观
+
+                                    # 4. 绘制目标图 (Target) - 右图
+                                    axes[1].imshow(tgt_img)
+                                    axes[1].set_title(f"Target Obs (Depth: {z_val:.3f}m)")
+                                    # 绘制绿色十字标记
+                                    axes[1].plot(u_tgt, v_tgt, marker='+', color='lime', markersize=15, markeredgewidth=2, label='Matched')
+                                    axes[1].legend(loc='upper right')
+                                    axes[1].axis('off')
+
+                                    # 5. 保存与清理
+                                    timestamp = datetime.now().strftime("%H%M%S_%f")
+                                    filename = f"match_step_{t_idx:03d}_{timestamp}.jpg"
+                                    save_path = os.path.join(save_root, filename)
+
+                                    plt.tight_layout()
+                                    plt.savefig(save_path, dpi=100) # dpi=100 保证清晰度
+                                    plt.close(fig) # [重要] 必须显式关闭 Figure，否则会造成严重的内存泄漏
+
+                                    logging.info(f"Saved visualization: {save_path}")
+
+                                except Exception as e:
+                                    logging.warning(f"Visualization failed (non-critical): {e}")
+                                    raise e
+                        else:
+                            logging.warning(f"Skipping SD matching: Image shape {src_img_np.shape} is not RGB/RGBA")
+                    except Exception as e:
+                        logging.warning(f"Semantic matching failed: {e}")
+                        raise e  # debug用
+            # =========================================================================
 
             flip_eef = not np.allclose(X_eef_transf, np.eye(4), rtol=1e-5, atol=1e-8)
             self.robot_configuration.set_keypoints(link_to_kpts, flip_eef=flip_eef)
@@ -3216,7 +3421,7 @@ class CPPolicy:
                     t_idx
                 ]  # hack for now to test if we needed to match actions rather than states
             if (
-                optimized_q is None and fallback_to_kpts_to_robot_q
+                    optimized_q is None and fallback_to_kpts_to_robot_q
             ) or ik_type == "kpts_to_robot_q":
                 logging.info(f"Falling back to IK on keypoints for t_idx: {t_idx}")
                 # TODO: set up IK optimization for eef pose. For now, directly provide eef pose for curobo's expected frame
@@ -3662,6 +3867,7 @@ class DemoGenerator:
         self.env.env.env.sim.forward()
         obs = self.env.get_observation()
 
+
         if constraint.constraint_type == "robot-object":
             # default to randomizing gripper qpos
             gripper_joint_positions = []
@@ -4095,6 +4301,25 @@ class DemoGenerator:
 
         success = (rewards[-1] == 1) if rewards else False
 
+        if success:
+            # 记录
+            logging.info(f"\n[Debug] Demo Initialization Check (Trial {len(demos) if 'demos' in locals() else '?'})")
+            logging.info("-" * 50)
+            has_printed = False
+            for key, value in obs.items():
+                # 这里的 key 通常是 "ObjectName_pose"，value 是 4x4 变换矩阵
+                if key.endswith("_pose") and isinstance(value, np.ndarray):
+                    # 提取平移向量 (x, y, z)
+                    pos = value[:3, 3]
+                    # 提取旋转 (简单的打印第一行，或者转欧拉角)
+                    logging.info(f"Object: {key:<25} | Pos (xyz): {pos}")
+                    has_printed = True
+
+            if not has_printed:
+                logging.info("No object poses found in obs. Checking raw eef pos:")
+                logging.info(f"EEF Pos: {obs.get('robot0_eef_pos', 'Not found')}")
+            logging.info("-" * 50 + "\n")
+
         # quirk of mujoco based envs that directly model the mjmodel
         # 把“物体被焊在手上”这一物理拓扑结构的改变，固化到 XML 字符串中保存下来。
         if isinstance(self.env, CPEnvRobomimic):
@@ -4347,6 +4572,9 @@ class Config:
     wandb_run_url: Optional[str] = None  # 本次实验的网页链接
     env_name: Optional[str] = None
     initialization: InitializationConfig = field(default_factory=InitializationConfig)  # 环境重置时的随机扰动配置
+    use_semantic_matching: bool = True
+    use_visual_matching: bool = True
+    model_path: Optional[str] = "/home/zgz/projects/second_work/stable-diffusion-v1-5"  # stable diffusion的模型路径
 
     def __post_init__(self):
         if self.motion_plan_save_dir:
@@ -4660,6 +4888,7 @@ def get_robot_configuration(
 
 
 def main(cfg: Config):
+    set_save_dir(cfg.save_dir)
     set_seed(cfg.seed)
     np.set_printoptions(suppress=True, precision=4)
     src_demos: List[Demo] = load_demos(
@@ -4679,6 +4908,7 @@ def main(cfg: Config):
         obs=dict(
             low_dim=["robot0_eef_pos"],
             rgb=["agentview_image", "agentview"],
+            depth=["agentview_depth"],
         ),
     )
     # 根据映射表将每个数据的名字与类型进行匹配
@@ -4691,16 +4921,12 @@ def main(cfg: Config):
     # 由于使用运动规划，不需要看图，所以use_camera_obs为False
     # 但是debug的时候需要保存为video进行检查轨迹是否正确，需要has_offscreen_renderer为True
     # viz_robot_kpts表示是否需要可视化机器人关键点，在debug下为True
-    if cfg.debug:
-        env_meta["env_kwargs"]["use_camera_obs"] = False
-        env_meta["env_kwargs"]["has_offscreen_renderer"] = True
-        viz_robot_kpts = True
-    else:
-        env_meta["env_kwargs"]["use_camera_obs"] = False
-        env_meta["env_kwargs"]["has_offscreen_renderer"] = False
-        viz_robot_kpts = False
+    viz_robot_kpts = cfg.debug
+    env_meta["env_kwargs"]["use_camera_obs"] = True
+    env_meta["env_kwargs"]["has_offscreen_renderer"] = True
 
     from robosuite.controllers import load_composite_controller_config
+
 
     if cfg.controller_type == "default":
         controller_config = load_composite_controller_config(robot="Panda")
@@ -4727,6 +4953,7 @@ def main(cfg: Config):
         EnvUtils.create_env_from_metadata(  # used for rendering only segmented demos
             env_meta=src_env_meta,
             use_image_obs=True,
+            use_depth_obs=True,
             render_offscreen=True,
             render=False,
         )
@@ -4734,8 +4961,9 @@ def main(cfg: Config):
     # 跑得快，纯物理计算
     src_env = EnvUtils.create_env_from_metadata(  # not great that we need to specify these keys
         env_meta=src_env_meta,
-        use_image_obs=False,
-        render_offscreen=False,
+        use_image_obs=True,
+        use_depth_obs=True,
+        render_offscreen=True,
         render=False,
     )
     src_env = CPEnvRobomimic(src_env)
@@ -4744,8 +4972,9 @@ def main(cfg: Config):
     # env是交互环境，用来跑新的仿真。
     env = EnvUtils.create_env_from_metadata(  # not great that we need to specify these keys
         env_meta=env_meta,
-        use_image_obs=False,
-        render_offscreen=False,
+        use_image_obs=True,
+        use_depth_obs=True,
+        render_offscreen=True,
         render=False,
     )
     env = CPEnvRobomimic(env)
@@ -4805,7 +5034,7 @@ def main(cfg: Config):
         env.env.env.sim.model._model,
         env.env.env.sim.data._data,
         robot_joint_names=env.env.env.robots[0].robot_model.joints
-        + env.env.env.robots[0].robot_model.grippers["robot0_right_hand"].joints,
+                          + env.env.env.robots[0].robot_model.grippers["robot0_right_hand"].joints,
     )
     # 提取**夹爪（End Effector）**的信息
     # 策略需要单独知道夹爪的结构，以便精确控制抓取动作
@@ -4814,14 +5043,17 @@ def main(cfg: Config):
         env.env.env.sim.model._model,
         env.env.env.sim.data._data,
         gripper_joint_names=env.env.env.robots[0]
-        .robot_model.grippers["robot0_right_hand"]
-        .joints,
-    )
+            .robot_model.grippers["robot0_right_hand"]
+            .joints,
+            )
     # 工作流程是：
     #     读取 constraint_sequences 里的下一个约束（比如“手要在杯子上 5cm”）。
     #     结合 robot_configuration 知道当前手在哪。
     #     使用 motion_planner 或 eef_interp_mink_motion_planner 计算一条路径，从“当前位置”移动到“满足约束的位置”。
     #     输出动作给机器人执行。
+    if cfg.use_visual_matching:
+        logging.info("Initializing Stable Diffusion Feature Matcher...")
+        sd_matcher = SDFeatureMatcher(model_id=cfg.model_path, device="cuda")
     cp_policy = CPPolicy(
         constraint_sequences,  # 1. 之前生成的几何约束序列
         motion_planner,  # 2. 主运动规划器
@@ -4831,7 +5063,9 @@ def main(cfg: Config):
         viz_robot_kpts,  # 6. 可视化数据：用于在界面上画出关键点的辅助数据
         env,  # 7. 环境句柄：用于和环境交互
         original_xml=original_xml,  # 8. 场景描述：XML 原文件
-        ignore_scaling=cfg.ignore_obj_geom_scaling  # 9. 配置标志
+        ignore_scaling=cfg.ignore_obj_geom_scaling,  # 9. 配置标志
+        sd_matcher = sd_matcher,  # 传入匹配器
+        use_semantic_matching = cfg.use_semantic_matching,  # 传入开关
     )
 
     # get a motion planning model where I can attach objects to the env if needed
@@ -4875,9 +5109,9 @@ def main(cfg: Config):
         )
         intermediate_folder = "successes" if demo["success"] else "failures"
         save_path = (
-            cfg.save_dir
-            / intermediate_folder
-            / (datetime.now().strftime("%H-%M-%S-%f") + ".hdf5")
+                cfg.save_dir
+                / intermediate_folder
+                / (datetime.now().strftime("%H-%M-%S-%f") + ".hdf5")
         )
 
         save_demo(demo, save_path.as_posix(), env_meta)
@@ -4913,22 +5147,22 @@ def main(cfg: Config):
     merge_demo_save_path = cfg.merge_demo_save_path
     if success_demo_save_paths:
         save_path = pathlib.Path(success_demo_save_paths[0].parent) / (
-            pathlib.Path(success_demo_save_paths[0]).stem + ".hdf5"
+                pathlib.Path(success_demo_save_paths[0]).stem + ".hdf5"
         )
         total_demos = count_total_demos(success_demo_save_paths)
         if merge_demo_save_path is None:
             merge_demo_save_path = pathlib.Path(save_path).parent / (
-                str(pathlib.Path(save_path).stem)
-                + f"_{total_demos}demos"
-                + str(pathlib.Path(save_path).suffix)
+                    str(pathlib.Path(save_path).stem)
+                    + f"_{total_demos}demos"
+                    + str(pathlib.Path(save_path).suffix)
             )
         merge_demo_files(success_demo_save_paths, save_path=merge_demo_save_path)
 
     if fail_demo_save_paths:
         merge_failure_demo_save_path = pathlib.Path(merge_demo_save_path).parent / (
-            str(pathlib.Path(merge_demo_save_path).stem)
-            + "_failures"
-            + str(pathlib.Path(merge_demo_save_path).suffix)
+                str(pathlib.Path(merge_demo_save_path).stem)
+                + "_failures"
+                + str(pathlib.Path(merge_demo_save_path).suffix)
         )
         merge_demo_files(fail_demo_save_paths, save_path=merge_failure_demo_save_path)
         # always save failure videos
@@ -4943,9 +5177,9 @@ def main(cfg: Config):
 
             intermediate_folder = "failures"
             save_video_path = (
-                cfg.save_dir
-                / intermediate_folder
-                / f"cpgen-mp={cfg.motion_planner_type}-seed={cfg.seed}-demo={i}.mp4"
+                    cfg.save_dir
+                    / intermediate_folder
+                    / f"cpgen-mp={cfg.motion_planner_type}-seed={cfg.seed}-demo={i}.mp4"
             )
 
             video_writer = imageio.get_writer(save_video_path, fps=20)
@@ -5012,9 +5246,9 @@ def main(cfg: Config):
     # 添加wandb运行链接
     if merge_demo_save_path is not None and cfg.wandb_run_url is not None:
         with h5py.File(
-            pathlib.Path(merge_demo_save_path).parent
-            / f"{str(pathlib.Path(merge_demo_save_path).stem)}_obs.hdf5",
-            "a",
+                pathlib.Path(merge_demo_save_path).parent
+                / f"{str(pathlib.Path(merge_demo_save_path).stem)}_obs.hdf5",
+                "a",
         ) as file:
             file.attrs["wandb_run_url"] = cfg.wandb_run_url
 
@@ -5025,15 +5259,25 @@ def main(cfg: Config):
     generate_videos_from_hdf5(
         MP4H5Config(
             h5_file_path=pathlib.Path(merge_demo_save_path).parent
-            / f"{str(pathlib.Path(merge_demo_save_path).stem)}_obs.hdf5",
+                         / f"{str(pathlib.Path(merge_demo_save_path).stem)}_obs.hdf5",
             all_demos=True,
             fps=20,
         )
     )
 
+save_dir = None
+
+def get_save_dir():
+    return save_dir
+
+def set_save_dir(save_dir_str):
+    global save_dir
+    save_dir = save_dir_str
 
 if __name__ == "__main__":
     # load demonstrations file
     # tyro 比 argparse 还要更进一步，它不需要add_argument添加一个又一个参数，而是自动将命令行参数与config的属性相对应
     # 并且如果运行 `python your_script.py --help`会自动生成帮助文档
     tyro.cli(main)
+
+## 这是添加了新的逻辑的生成文件

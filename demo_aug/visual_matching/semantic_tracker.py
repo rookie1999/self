@@ -54,7 +54,6 @@ class SDFeatureMatcher:
         self.pipe.unet.up_blocks[self.layer_idx].register_forward_hook(hook_fn)
 
     def extract_features(self, image, prompt="a photo of an object"):
-    # def extract_features(self, image, prompt="a ceramic mug"):
         """
         从单张图像提取特征
         :param image: PIL Image 对象
@@ -194,7 +193,7 @@ if __name__ == "__main__":
     # 1. 设置你的本地模型路径 (请替换为你实际下载的路径)
     # 例如 Windows: r"D:\AI_Models\stable-diffusion-v1-5"
     # 例如 Linux/Mac: "/home/user/models/stable-diffusion-v1-5"
-    local_model_path = "/home/benson/projects/second_work/cpgen/stable-diffusion-v1-5"
+    local_model_path = "/home/benson/projects/second_work/stable-diffusion-v1-5"
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # 2. 准备图像路径
