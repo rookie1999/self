@@ -17,6 +17,7 @@ from demo_aug.utils.demo_segmentation_utils import (
     run_llm_success_segmentation,
     unparse_interactions,
 )
+from scripts.dataset_states_to_obs_with_privilege import dataset_states_to_obs
 
 os.environ["MUJOCO_GL"] = "egl"
 
@@ -41,6 +42,9 @@ import numpy as np
 import robosuite
 import torch
 import tyro
+import torch.nn as nn
+import torch.optim as optim
+from collections import deque
 from lxml import etree as ET
 from mink import Configuration
 from mujoco import MjData, MjModel, mj_fwdPosition, viewer
@@ -92,168 +96,491 @@ from demo_aug.utils.xml_utils import (
 )
 
 
+def save_checkpoint(path, guide, curriculum):
+    """保存所有状态，实现断点续传"""
+    checkpoint = {
+        # --- 模型部分 ---
+        'model_state': guide.model.state_dict(),
+        'optimizer_state': guide.optimizer.state_dict(),
+
+        # --- 数据部分 (关键：不需要重新收集数据) ---
+        'pos_buffer': list(guide.pos_buffer), # 转为 list 以便序列化
+        'neg_buffer': list(guide.neg_buffer),
+
+        # --- 统计量部分 (关键：模型能正确处理输入) ---
+        'input_mean': guide.input_mean,
+        'input_std': guide.input_std,
+        'n_stats': guide.n_stats,
+
+        # --- 课程进度 ---
+        'generated_count': curriculum.generated_count
+    }
+    torch.save(checkpoint, path)
+
+def load_checkpoint(path, guide, curriculum, reset_curriculum=False):
+    if not os.path.exists(path):
+        print(f"⚠️ No checkpoint found at {path}, starting from scratch (Epsilon=1.0).")
+        return False
+
+    print(f"🔄 Loading checkpoint from {path}...")
+    try:
+        checkpoint = torch.load(path, map_location=guide.device, weights_only=False)
+
+        # 1. 恢复模型权重与统计量 (永远需要)
+        guide.model.load_state_dict(checkpoint['model_state'])
+        guide.optimizer.load_state_dict(checkpoint['optimizer_state'])
+        guide.pos_buffer = deque(checkpoint['pos_buffer'], maxlen=5000)
+        guide.neg_buffer = deque(checkpoint['neg_buffer'], maxlen=5000)
+        guide.input_mean = checkpoint['input_mean'].to(guide.device)
+        guide.input_std = checkpoint['input_std'].to(guide.device)
+        guide.n_stats = checkpoint['n_stats']
+
+        # 获取之前训练过的总步数（如果有记录的话，没有就默认为0）
+        prev_generated_count = checkpoint.get('generated_count', 0)
+
+        # 2. 策略分歧点
+        if reset_curriculum:
+            print("🔄 [Strategy] Model weights loaded. Resetting difficulty to EASY.")
+
+            # [核心需求实现]
+            # 重置进度，让 range 回到 0.05
+            curriculum.generated_count = 0
+
+            # 动态设置起始 Epsilon：
+            total_experience = len(guide.pos_buffer) + len(guide.neg_buffer)
+
+            # 定义衰减逻辑：经验越丰富，起始探索率越低，但最低不低于 0.3
+            if total_experience < 200:
+                new_start_eps = 1.0  # 全随机
+            elif total_experience < 500:
+                new_start_eps = 0.7  # 多探索
+            elif total_experience < 1000:
+                new_start_eps = 0.4  # 半信半疑
+            else:
+                new_start_eps = 0.2  # 少量探索
+
+            curriculum.start_epsilon = new_start_eps
+            print(f"🔄 [Strategy] Adaptive Start Epsilon: {new_start_eps} (Based on {total_experience} samples)")
+        else:
+            print("🔄 [Strategy] Resuming training from previous progress.")
+            # 恢复进度，接着上次的练
+            curriculum.generated_count = prev_generated_count
+            # 保持原始设定，因为我们要延续之前的衰减曲线
+            curriculum.start_epsilon = 1.0
+
+        # 3. 刷新状态
+        curriculum.update_schedule()
+
+        print(f"✅ Checkpoint loaded!")
+        print(f"   Buffer: {len(guide.pos_buffer)}P / {len(guide.neg_buffer)}N")
+        print(f"   Current Status: Step {curriculum.generated_count}, "
+              f"Eps {curriculum.epsilon:.2f}, Range {curriculum.current_range_limit:.2f}")
+        return True
+    except Exception as e:
+        print(f"❌ Failed to load checkpoint: {e}")
+        # 如果加载失败，确保回退到初始状态
+        curriculum.start_epsilon = 1.0
+        return False
+
 class PositionFeasibilityGuide:
-    def __init__(self, object_dim=3, hidden_dim=128, lr=0.001, device='cuda'):
-        """
-        位置可行性专家模型
-        输入：物体位置 (x, y, z)
-        输出：该位置可解/成功的概率 (0~1)
-        """
-        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
-        self.input_dim = object_dim
+    def __init__(self, object_dim=3, device='cpu', learning_rate=1e-3):
+        self.device = device
+        self.object_dim = object_dim
 
-        # 归一化统计量
-        self.mean = torch.zeros(self.input_dim).to(self.device)
-        self.std = torch.ones(self.input_dim).to(self.device)
-        self.n_samples = 0
-
-        # 网络结构
+        # 1. 定义模型 (简单的 MLP)
         self.model = nn.Sequential(
-            nn.Linear(self.input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+            nn.Linear(object_dim, 128),
             nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Dropout(0.1),  # 防止过拟合
+            nn.Linear(128, 64),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
+            nn.Linear(64, 1),
             nn.Sigmoid()
-        ).to(self.device)
+        ).to(device)
 
-        self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
         self.loss_fn = nn.BCELoss()
-        self.guidance_lr = 0.01  # 修正步长
 
-        # 经验回放池
-        self.pos_buffer = deque(maxlen=5000)  # 存成功的位置
-        self.neg_buffer = deque(maxlen=5000)  # 存失败的位置
-        self.batch_size = 64
+        # 2. 数据缓冲区
+        self.pos_buffer = deque(maxlen=5000) # 成功样本
+        self.neg_buffer = deque(maxlen=5000) # 失败样本
 
-    def _update_stats(self, x):
-        batch_mean = torch.mean(x, dim=0)
-        batch_std = torch.std(x, dim=0) + 1e-8
-        alpha = 0.01
-        if self.n_samples == 0:
-            self.mean = batch_mean;
-            self.std = batch_std
+        # 3. 归一化统计量 (Running Statistics)
+        self.register_buffer_stats()
+
+        # 4. [关键] 工作空间限制 (根据你的 NutAssembly 任务估算)
+        # 格式: [[x_min, x_max], [y_min, y_max], [z_min, z_max]]
+        # 假设 NutAssemblySquare 桌面中心大概在 (0,0) 附近
+        self.workspace_limits = torch.tensor([
+            [-0.30, 0.30],  # X 轴范围
+            [-0.30, 0.30],  # Y 轴范围
+            [ 0.80, 1.00]   # Z 轴范围 (桌面高度通常是 0.8~0.9)
+        ]).to(device)
+
+        self.guidance_lr = 0.005  # 修正位置时的步长
+
+    def register_buffer_stats(self):
+        """初始化归一化参数"""
+        self.input_mean = torch.zeros(self.object_dim).to(self.device)
+        self.input_std = torch.ones(self.object_dim).to(self.device)
+        self.n_stats = 0
+
+    def update_stats(self, new_data):
+        """简单的在线均值方差更新"""
+        batch_mean = torch.mean(new_data, dim=0)
+        batch_std = torch.std(new_data, dim=0) + 1e-6
+
+        # 简单的移动平均更新 (Momentum update)
+        alpha = 0.1
+        if self.n_stats == 0:
+            self.input_mean = batch_mean
+            self.input_std = batch_std
         else:
-            self.mean = (1 - alpha) * self.mean + alpha * batch_mean
-            self.std = (1 - alpha) * self.std + alpha * batch_std
-        self.n_samples += 1
+            self.input_mean = (1 - alpha) * self.input_mean + alpha * batch_mean
+            self.input_std = (1 - alpha) * self.input_std + alpha * batch_std
+        self.n_stats += 1
 
-    def optimize_position(self, raw_object_pos, steps=20):
+    def normalize(self, x):
+        return (x - self.input_mean) / (self.input_std + 1e-8)
+
+    def update_model(self, pos, is_success):
         """
-        [核心] 输入一个随机位置，如果模型认为它不好，就用梯度把它修好
+        收集数据并基于经验回放池进行多步训练
         """
-        self.model.eval()
-        obj_tensor = torch.tensor(raw_object_pos, dtype=torch.float32, device=self.device, requires_grad=True)
+        # 1. 存入 Buffer
+        target_buffer = self.pos_buffer if is_success else self.neg_buffer
+        target_buffer.append(pos)
 
-        for i in range(steps):
-            norm_input = (obj_tensor - self.mean) / self.std
-            prob = self.model(norm_input)
+        # -----------------------------------------------------
+        # [配置] 训练参数
+        # -----------------------------------------------------
+        batch_size = 64
+        # -----------------------------------------------------
+        # [配置] 训练参数
+        # -----------------------------------------------------
+        batch_size = 64
 
-            # 【满足即止】: 只要及格(>0.55)就停，不要过度优化到中心，保留边界多样性
-            if prob.item() > 0.55:
-                break
+        # =========== [关键修改] 动态计算训练步数 ===========
+        total_samples = len(self.pos_buffer) + len(self.neg_buffer)
 
-            loss = self.loss_fn(prob, torch.tensor([1.0], device=self.device))
-            self.model.zero_grad()
-            loss.backward()
+        # 目标：每次更新至少把所有数据过一遍 (1 Epoch)
+        # 计算需要多少个 Batch 才能覆盖所有数据
+        needed_steps_for_one_epoch = total_samples // batch_size
+        # 设定策略：
+        # 1. 下限 5 步：保证初期多练练
+        # 2. 上限 50 步：防止后期数据太多导致卡顿 (50 * 64 = 3200 样本，足够了)
+        # 3. 中间取值：尽可能跑完一个 Epoch
+        train_steps = max(5, min(needed_steps_for_one_epoch, 50))
+        # =================================================
 
-            with torch.no_grad():
-                grad = obj_tensor.grad
-                if len(grad) >= 3: grad[2] = 0.0  # 锁死Z轴
-                obj_tensor -= self.guidance_lr * grad
-                obj_tensor.grad.zero_()
+        # -----------------------------------------------------
+        # [检查] 是否满足最小训练条件
+        # -----------------------------------------------------
+        # 1. 总样本数必须能填满一个 Batch，否则 Batch Normalization (如果有) 会不稳，且梯度噪声大
+        if (len(self.pos_buffer) + len(self.neg_buffer)) < batch_size:
+            return
 
-        return obj_tensor.detach().cpu().numpy()
+        # 2. 正负样本每一类至少要有 2 个，否则无法形成分类边界 (全 0 或 全 1 的 Label 会导致模型坍塌)
+        if len(self.pos_buffer) < 2 or len(self.neg_buffer) < 2:
+            return
 
-    def update_model(self, object_pos, is_feasible):
         self.model.train()
-        if is_feasible:
-            self.pos_buffer.append(object_pos)
-        else:
-            self.neg_buffer.append(object_pos)
+        final_loss = 0.0
 
-        # 简单的训练触发逻辑
-        if len(self.pos_buffer) > 10 and len(self.neg_buffer) > 10:
-            self._train_step()
+        # -----------------------------------------------------
+        # [循环] 多步梯度更新 (Online Learning w/ Replay)
+        # -----------------------------------------------------
+        for step_i in range(train_steps):
 
-    def _train_step(self):
-        # 简单采样训练
-        half_batch = self.batch_size // 2
-        pos_indices = np.random.choice(len(self.pos_buffer), half_batch, replace=True)
-        neg_indices = np.random.choice(len(self.neg_buffer), half_batch, replace=True)
+            # --- A. 动态互补采样逻辑 (核心修复) ---
+            # 目标：尽量各占一半 (16 vs 16)
+            n_pos = batch_size // 2
+            n_neg = batch_size - n_pos
 
-        pos_data = np.array([self.pos_buffer[i] for i in pos_indices])
-        neg_data = np.array([self.neg_buffer[i] for i in neg_indices])
+            n_pos_total = len(self.pos_buffer)
+            n_neg_total = len(self.neg_buffer)
 
-        inputs = torch.tensor(np.concatenate([pos_data, neg_data]), dtype=torch.float32).to(self.device)
-        labels = torch.tensor(np.concatenate([np.ones(half_batch), np.zeros(half_batch)]),
-                              dtype=torch.float32).unsqueeze(1).to(self.device)
+            # 如果某一方样本不够，就取它的全部，另一方多取点补齐
+            if n_pos_total < n_pos:
+                n_pos = n_pos_total
+                n_neg = batch_size - n_pos # 此时必然满足 n_neg <= n_neg_total (因为总数 > batch_size)
+            elif n_neg_total < n_neg:
+                n_neg = n_neg_total
+                n_pos = batch_size - n_neg
 
-        with torch.no_grad(): self._update_stats(inputs)
+            # 执行采样
+            pos_samples = random.sample(self.pos_buffer, n_pos)
+            neg_samples = random.sample(self.neg_buffer, n_neg)
 
-        for _ in range(3):
+            # --- B. 数据转换 ---
+            data_np = np.array(pos_samples + neg_samples, dtype=np.float32)
+            labels_np = np.array([1]*n_pos + [0]*n_neg, dtype=np.float32).reshape(-1, 1)
+
+            data = torch.tensor(data_np).to(self.device)
+            labels = torch.tensor(labels_np).to(self.device)
+
+            # --- C. 更新归一化统计量 ---
+            # 建议：只在每轮训练的第一步更新统计量，防止单次更新中统计量抖动过大
+            if step_i == 0:
+                self.update_stats(data)
+
+            # --- D. 前向与反向传播 ---
+            # 注意：这里使用归一化后的数据输入模型
+            norm_data = self.normalize(data)
+            preds = self.model(norm_data)
+            loss = self.loss_fn(preds, labels)
+
             self.optimizer.zero_grad()
-            loss = self.loss_fn(self.model((inputs - self.mean) / self.std), labels)
             loss.backward()
             self.optimizer.step()
 
+            final_loss = loss.item()
+
+        # -----------------------------------------------------
+        # [日志] 抽样打印训练状态
+        # -----------------------------------------------------
+        if np.random.random() < 0.2:
+            print(f"   📉 [TRAIN] Steps: {train_steps} | Loss: {final_loss:.4f} | "
+                  f"Batch: {n_pos}P+{n_neg}N | Pool: {len(self.pos_buffer)}P/{len(self.neg_buffer)}N")
+
+    def optimize_position(self, initial_pos):
+        """
+        输入初始位置，利用梯度上升寻找使得成功率更高的新位置
+        集成：梯度截断、强距离惩罚、失败回退 (移除了边界约束)
+        """
+        self.model.eval()
+
+        original_z = initial_pos[2]
+
+        # 1. 准备数据
+        # start_tensor 用于计算距离惩罚，作为“锚点”
+        start_tensor = torch.tensor(initial_pos, dtype=torch.float32, device=self.device)
+        obj_tensor = start_tensor.clone().requires_grad_(True)
+
+        start_pos_str = f"({initial_pos[0]:.2f}, {initial_pos[1]:.2f})"
+        initial_prob = 0.5
+
+        # 迭代优化
+        for i in range(10):
+            norm_input = self.normalize(obj_tensor)
+            prob = self.model(norm_input)
+
+            if i == 0:
+                initial_prob = prob.item()
+
+            target = torch.tensor([1.0], device=self.device)
+            base_loss = self.loss_fn(prob, target)
+
+            # =========== [Point 2 部分 A] 强距离惩罚 ===========
+            # 既然没有边界墙，这根“绳子”就要拉紧一点
+            # 系数设为 20.0，只要偏离初始点，Loss 就会迅速上升
+            dist_sq = torch.sum((obj_tensor - start_tensor)**2)
+
+            # [修改] 移除了 bound_loss
+            loss = base_loss + 20.0 * dist_sq
+            # =================================================
+
+            self.model.zero_grad()
+            loss.backward()
+
+            # =========== [Point 2 部分 B] 梯度截断 ===========
+            grad = obj_tensor.grad.data
+            grad[2] = 0.0 # 锁 Z 轴
+
+            # 关键：限制单步梯度的最大值，防止“飞出天际”
+            # 将梯度限制在 [-1.0, 1.0] 范围内
+            grad = torch.clamp(grad, -1.0, 1.0)
+
+            obj_tensor.data -= self.guidance_lr * grad
+
+            # [修改] 移除了 obj_tensor.data 的 clamp 操作 (因为没有 workspace_limits 了)
+
+            obj_tensor.grad.zero_()
+
+        # --- 最终结果计算 ---
+        final_prob = self.model(self.normalize(obj_tensor)).item()
+        final_pos = obj_tensor.detach().cpu().numpy()
+        final_pos[2] = original_z
+
+        end_pos_str = f"({final_pos[0]:.2f}, {final_pos[1]:.2f})"
+
+        # =========== [Point 3] 置信度回退机制 ===========
+        # 如果优化后的概率比初始概率还低（或者绝对值太低），说明优化失败，回滚。
+        if final_prob < (initial_prob - 0.05) or final_prob < 0.2:
+            print(f"      ⚠️ [REJECT] Optimization degraded ({initial_prob:.2f}->{final_prob:.2f}). Reverting to random.")
+            return initial_pos
+        # ==============================================
+
+        print(f"      ✨ [OPTIMIZE] Pos: {start_pos_str} -> {end_pos_str} | Success Prob: {initial_prob:.2f} -> {final_prob:.2f}")
+
+        return final_pos
+
+# class CurriculumManager:
+#     def __init__(self, guide, total_target_demos=100, start_epsilon=1.0):
+#         """
+#         Args:
+#             guide: PositionFeasibilityGuide 实例
+#             total_target_demos: 计划生成的 Demo 总数
+#             start_epsilon: 初始探索率 (默认为 1.0 全随机)
+#         """
+#         self.guide = guide
+#         self.total_target_demos = total_target_demos
+#         self.generated_count = 0
+
+#         # =========== [修复] 初始化 start_epsilon ===========
+#         self.start_epsilon = start_epsilon
+#         self.epsilon = start_epsilon
+#         # =================================================
+
+#         self.epsilon_min = 0.2
+
+#         # 范围控制：为了提高成功率，建议把 max_range 稍微改小一点 (0.12)
+#         self.current_range_limit = 0.02
+#         self.min_range = 0.02
+#         self.max_range = 0.12
+
+#         self.warmup_samples_threshold = 200
+
+#     def get_next_position(self, rough_pos):
+#         # 1. 获取当前数据总量
+#         total_samples = len(self.guide.pos_buffer) + len(self.guide.neg_buffer)
+
+#         status_prefix = f"[Curriculum {self.generated_count}/{self.total_target_demos}]"
+
+#         # Warmup
+#         if total_samples < self.warmup_samples_threshold:
+#             print(f"{status_prefix} 🟢 [WARMUP] 样本不足 ({total_samples}/{self.warmup_samples_threshold}). 使用随机生成。")
+#             return rough_pos, self.current_range_limit
+
+#         # Epsilon-Greedy
+#         if random.random() < self.epsilon:
+#             print(f"{status_prefix} 🎲 [EXPLORE] Epsilon探索 (eps={self.epsilon:.2f}). 忽略模型，使用随机。")
+#             return rough_pos, self.current_range_limit
+#         else:
+#             print(f"{status_prefix} 🤖 [EXPLOIT] 模型接管 (Range={self.current_range_limit:.2f}). 调用 AI 优化位置...")
+#             try:
+#                 optimized_pos = self.guide.optimize_position(rough_pos)
+#                 return optimized_pos, self.current_range_limit
+#             except Exception as e:
+#                 print(f"[Curriculum] AI Optimization failed, using random: {e}")
+#                 return rough_pos, self.current_range_limit
+
+#     def update_schedule(self):
+#         """根据当前进度更新策略"""
+#         progress = min(1.0, self.generated_count / self.total_target_demos)
+
+#         # 使用 start_epsilon 进行计算
+#         self.epsilon = self.start_epsilon - (self.start_epsilon - self.epsilon_min) * progress
+#         self.current_range_limit = self.min_range + (self.max_range - self.min_range) * progress
+
+#     def increment_count(self):
+#         self.generated_count += 1
+#         self.update_schedule()
 
 class CurriculumManager:
-    def __init__(self, position_guide, total_target_demos, max_range=0.5):
-        self.guide = position_guide
-        self.total_target = total_target_demos
-        self.max_range = max_range
+    def __init__(self, guide, total_target_demos=100, start_epsilon=1.0):
+        self.guide = guide
+        self.total_target_demos = total_target_demos
         self.generated_count = 0
 
-    def get_next_position(self, current_pos):
+        # --- 探索策略参数 ---
+        self.start_epsilon = start_epsilon
+        self.epsilon = start_epsilon
+        self.epsilon_min = 0.2
+
+        # --- 难度控制参数 (Range) ---
+        self.current_range_limit = 0.02
+        self.min_range = 0.02
+        # 设大一点，让自适应机制去探底
+        self.max_range = 0.20
+
+        self.warmup_samples_threshold = 200
+
+        # --- 自适应监控与刹车机制 ---
+        self.success_history = deque(maxlen=20)
+        self.detected_limit = self.max_range
+        self.is_range_frozen = False
+
+    def _fmt(self, pos):
+        """辅助函数：将 numpy 数组格式化为易读的字符串 (x, y, z)"""
+        return f"({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f})"
+
+    def get_next_position(self, rough_pos):
         """
-        输入：Robosuite 原生随机的位置 (current_pos)
-        输出：经过课程扩展 + AI 修正后的新位置
+        根据当前 Range 生成扰动位置，并决定是随机探索还是利用模型优化位置
         """
-        # 1. 课程进度 (0.0 -> 1.0)
-        progress = min(1.0, self.generated_count / max(1, self.total_target))
+        # 1. 获取当前数据总量
+        total_samples = len(self.guide.pos_buffer) + len(self.guide.neg_buffer)
+        status_prefix = f"[Curriculum {self.generated_count}/{self.total_target_demos}]"
 
-        # 2. 动态范围 (Curriculum Range): 0.05m -> max_range (e.g. 0.5m)
-        # 这是“我们要挑战的难度”。起步很小，慢慢变大。
-        current_range_limit = 0.05 + (self.max_range - 0.05) * progress
-
-        # 3. 动态 Epsilon: 1.0 -> 0.2
-        # 初期全随机(收集负样本很重要)，后期靠AI修正
-        epsilon = 1.0 - (0.8 * progress)
-
-        # --- 生成逻辑 ---
-
-        # A. 叠加额外的噪声 (强制探索边界)
-        # 即使 initialization_noise 设得很小，我们这里也会手动把它撑大到 current_range_limit
-        noise = np.random.uniform(-current_range_limit, current_range_limit, size=3)
+        # ================== [核心修复] 主动注入噪声 ==================
+        noise = np.random.uniform(
+            low  = -self.current_range_limit,
+            high =  self.current_range_limit,
+            size = 3
+        )
+        # 锁定 Z 轴噪声 (可选)
         noise[2] = 0.0
 
-        # 假设物体应该在原点附近，我们基于原点撒点 (或者基于当前点叠加)
-        # 这里为了稳健，我们直接在 current_pos 基础上叠加，但要注意不要飘出天际
-        rough_pos = current_pos + noise
+        # 生成真正的“挑战位”
+        noisy_pos = rough_pos + noise
+        # ==========================================================
 
-        # B. 决策：随机 还是 AI？
-        final_pos = rough_pos
+        # 2. Warmup 阶段
+        if total_samples < self.warmup_samples_threshold:
+            # [修改] 打印 noisy_pos
+            print(f"{status_prefix} 🟢 [WARMUP] 样本不足. Range={self.current_range_limit:.2f} | Pos: {self._fmt(noisy_pos)}")
+            return noisy_pos, self.current_range_limit
 
-        # 只有当 AI 见过世面了 (>20条数据) 才启用
-        has_data = (len(self.guide.pos_buffer) + len(self.guide.neg_buffer)) > 20
-        use_ai = (has_data and np.random.random() > epsilon)
-
-        if use_ai:
+        # 3. Epsilon-Greedy 策略
+        if random.random() < self.epsilon:
+            # [修改] 打印 noisy_pos
+            print(f"{status_prefix} 🎲 [EXPLORE] Epsilon探索 (eps={self.epsilon:.2f}) | Pos: {self._fmt(noisy_pos)}")
+            return noisy_pos, self.current_range_limit
+        else:
+            # [修改] 打印 noisy_pos 作为 "Input"
+            print(f"{status_prefix} 🤖 [EXPLOIT] 模型接管 (Range={self.current_range_limit:.2f}) | Input: {self._fmt(noisy_pos)}")
             try:
-                # 【核心结合】
-                # 如果 rough_pos 是个死位（比如 0.5m），AI 会把它拉回 0.35m
-                # 如果 rough_pos 是个好位（比如 0.2m），AI 不会动它 (>0.55 break)
-                final_pos = self.guide.optimize_position(rough_pos, steps=20)
-            except:
-                pass
+                # 让 AI 尝试修复这个“烂位置”
+                optimized_pos = self.guide.optimize_position(noisy_pos)
 
-        return final_pos, current_range_limit
+                # 注意：self.guide.optimize_position 内部通常已经会打印 "Start -> End" 的日志
+                # 所以这里不需要再打印 optimized_pos，否则日志会重复
 
-    def increment_count(self):
+                return optimized_pos, self.current_range_limit
+            except Exception as e:
+                print(f"[Curriculum] AI Optimization failed, using random: {e}")
+                return noisy_pos, self.current_range_limit
+
+    def update_schedule(self):
+        """核心调度逻辑：更新 Epsilon 和 Range，执行自适应刹车"""
+        progress = min(1.0, self.generated_count / self.total_target_demos)
+
+        # 更新 Epsilon
+        self.epsilon = self.start_epsilon - (self.start_epsilon - self.epsilon_min) * progress
+
+        # 新版：对数增长 / 根号增长 (前期涨得快，后期慢)
+        # 比如用 sqrt(progress)，在 progress=0.25 (第50步) 时就能达到 50% 的 Range
+        curve_factor = progress ** 0.5
+        planned_range = self.min_range + (self.max_range - self.min_range) * curve_factor
+
+        # 自适应刹车逻辑
+        if not self.is_range_frozen:
+            if len(self.success_history) == self.success_history.maxlen and planned_range > 0.05:
+                recent_success_rate = sum(self.success_history) / len(self.success_history)
+                # 如果最近 20 次成功率低于 30%，锁死 Range
+                if recent_success_rate < 0.30:
+                    print(f"🛑 [AUTO-STOP] Difficulty Limit Detected! Success rate dropped to {recent_success_rate:.2f}.")
+                    print(f"    Locking max range at {planned_range:.3f}")
+                    self.detected_limit = planned_range
+                    self.is_range_frozen = True
+
+        self.current_range_limit = min(planned_range, self.detected_limit)
+
+    def increment_count(self, is_success: bool = True):
         self.generated_count += 1
-
+        self.success_history.append(1 if is_success else 0)
+        self.update_schedule()
 
 def set_seed(seed: int) -> None:
     random.seed(seed)  # Python's random module
@@ -313,7 +640,7 @@ def recursively_unpack_h5py(obj) -> Dict[str, Any]:
 
 
 def load_demos(
-        demo_path: str, start_idx: int = 0, end_idx: Optional[int] = None
+    demo_path: str, start_idx: int = 0, end_idx: Optional[int] = None
 ) -> List[Demo]:
     demos: List[Demo] = []
     with h5py.File(demo_path, "r") as f:
@@ -386,11 +713,11 @@ class CPEnv:
 
     @staticmethod
     def is_collision(
-            model: mujoco.MjModel,
-            data: mujoco.MjData,
-            robot_body_name: str = "gripper0_right_right_gripper",
-            exclude_prefixes: List[str] = ["robot", "gripper"],
-            verbose: bool = False,
+        model: mujoco.MjModel,
+        data: mujoco.MjData,
+        robot_body_name: str = "gripper0_right_right_gripper",
+        exclude_prefixes: List[str] = ["robot", "gripper"],
+        verbose: bool = False,
     ) -> bool:
         """
         Check if there is a collision between the robot and non-robot geometries.
@@ -431,7 +758,7 @@ class CPEnv:
     def reset(self, let_env_settle: bool = True) -> Tuple[Dict, float, bool, Dict]:
         obs = self.env.reset()
         while CPEnv.is_collision(
-                self.env.env.sim.model._model, self.env.env.sim.data._data
+            self.env.env.sim.model._model, self.env.env.sim.data._data
         ):
             print(
                 "reset caused collision, re-trying ..."
@@ -526,7 +853,7 @@ class CPEnv:
 
                     if is_relevant_contact:
                         is_contacting = True
-                        break  # 只要发现哪怕一个接触点，就视为已接触
+                        break # 只要发现哪怕一个接触点，就视为已接触
 
                 # [接触信息] 如果发生接触，读取目标受到的外力合力
                 if is_contacting:
@@ -581,7 +908,7 @@ class CPEnv:
         pass
 
     def update_pose_frame(
-            self, src_frame: str, pose_src_frame: np.ndarray, dest_frame: str
+        self, src_frame: str, pose_src_frame: np.ndarray, dest_frame: str
     ) -> np.ndarray:
         # Code to get pose
         pass
@@ -658,7 +985,7 @@ class CPEnvRobomimic(CPEnv):
         return sizes
 
     def update_pose_frame(
-            self, src_frame: str, pose_src_frame: np.ndarray, dest_frame: str
+        self, src_frame: str, pose_src_frame: np.ndarray, dest_frame: str
     ) -> np.ndarray:
         """
         Given a source frame and pose in src_frame, return the pose in the dest frame.
@@ -716,7 +1043,6 @@ class Symmetry:
         None  # e.g. 0 degrees and 180 degrees; use LLM or something
     )
     skip_default: bool = False  # whether to skip the default non-symmetry transform
-
     # effectively changes the source demo; hacky code --- better to update the source demo itself ...
 
     def to_dict(self):
@@ -845,23 +1171,23 @@ class Constraint:
 
     # consider other case where there's a weld constraint, though that's probably handled by previous stuff already?
     def keypoints_world_frame(
-            self,
-            obj_name: str,
-            obj_pose: np.ndarray,
-            obj_transform: Union[np.ndarray, Callable],
-            robot_pose: np.ndarray,
+        self,
+        obj_name: str,
+        obj_pose: np.ndarray,
+        obj_transform: Union[np.ndarray, Callable],
+        robot_pose: np.ndarray,
     ) -> np.ndarray:
         keypoints_obj_frame = self.keypoints_obj_frame[obj_name]
         keypoints_world_frame = np.zeros_like(keypoints_obj_frame)
         for i, keypoint in enumerate(keypoints_obj_frame):
             transformed_keypoint = np.dot(obj_transform, np.append(keypoint, 1))
             keypoints_world_frame[i] = (
-                    transformed_keypoint[:3] + obj_pose[:3] + robot_pose[:3]
+                transformed_keypoint[:3] + obj_pose[:3] + robot_pose[:3]
             )
         return keypoints_world_frame
 
     def is_satisfied(
-            self, obj_name: str, obj_pose: np.ndarray, obj_state: np.ndarray
+        self, obj_name: str, obj_pose: np.ndarray, obj_state: np.ndarray
     ) -> bool:
         """Check if the constraint is satisfied based on the object state."""
         # Implement the logic to check if the constraint is satisfied
@@ -875,13 +1201,13 @@ class Constraint:
 
 
 def is_env_state_close(
-        env: CPEnv,
-        constraint: Constraint,
-        pos_threshold=0.01,
-        rot_threshold=0.1,
-        eef_pos_threshold=0.01,
-        eef_rot_threshold=0.05,
-        gripper_threshold=0.01,
+    env: CPEnv,
+    constraint: Constraint,
+    pos_threshold=0.01,
+    rot_threshold=0.1,
+    eef_pos_threshold=0.01,
+    eef_rot_threshold=0.05,
+    gripper_threshold=0.01,
 ):
     """
     Checks if the current environment state is close enough to the stored src_obj_pose.
@@ -904,8 +1230,8 @@ def is_env_state_close(
     obs = env.get_observation()  # Assuming env provides a method to get observations
     for obj_name in constraint.obj_names:
         if (
-                f"{obj_name}_pose" not in obs.keys()
-                or obj_name not in constraint.src_obj_pose
+            f"{obj_name}_pose" not in obs.keys()
+            or obj_name not in constraint.src_obj_pose
         ):
             continue  # Skip if object pose isn't available
 
@@ -950,8 +1276,8 @@ def is_env_state_close(
 
     # Compare gripper joint positions
     if (
-            "robot0_gripper_qpos" in obs
-            and "robot0_gripper_qpos" in constraint.src_obs.keys()
+        "robot0_gripper_qpos" in obs
+        and "robot0_gripper_qpos" in constraint.src_obs.keys()
     ):
         current_gripper_qpos = np.array(
             obs["robot0_gripper_qpos"]
@@ -1030,16 +1356,16 @@ EnvRobosuite.reset_to = reset_to
 
 
 def get_constraint_data(
-        demo: Demo,
-        src_env,
-        override_constraints: bool = False,
-        override_interactions: bool = False,
-        demo_segmentation_type: Optional[Literal[
-            "distance-based", "llm-e2e", "llm-success"
-        ]] = None,
-        interaction_threshold: float = 0.03,
-        create_video: bool = False,
-        constraints_path: Optional[str] = None,
+    demo: Demo,
+    src_env,
+    override_constraints: bool = False,
+    override_interactions: bool = False,
+    demo_segmentation_type: Optional[Literal[
+        "distance-based", "llm-e2e", "llm-success"
+    ]] = None,
+    interaction_threshold: float = 0.03,
+    create_video: bool = False,
+    constraints_path: Optional[str] = None,
 ) -> List[Constraint]:
     """
     Extracts constraints from a demo using the provided source environment.
@@ -1053,22 +1379,22 @@ def get_constraint_data(
     constraints: List[Constraint] = []
     default_constraints_path = (
         (
-                pathlib.Path(demo.demo_path).parent
-                / pathlib.Path(demo.demo_path).stem
-                / (f"{demo_segmentation_type}-constraints.json" if demo_segmentation_type else "constraints.json")
+            pathlib.Path(demo.demo_path).parent
+            / pathlib.Path(demo.demo_path).stem
+            / (f"{demo_segmentation_type}-constraints.json" if demo_segmentation_type else "constraints.json")
         )
         if constraints_path is None
         else pathlib.Path(constraints_path)
     )
     default_segments_output_dir = (
-            pathlib.Path(demo.demo_path).parent
-            / pathlib.Path(demo.demo_path).stem
-            / (f"{demo_segmentation_type}-segments" if demo_segmentation_type else "segments")
+        pathlib.Path(demo.demo_path).parent
+        / pathlib.Path(demo.demo_path).stem
+        / (f"{demo_segmentation_type}-segments" if demo_segmentation_type else "segments")
     )
     default_video_dir = (
-            pathlib.Path(demo.demo_path).parent
-            / pathlib.Path(demo.demo_path).stem
-            / "videos"
+        pathlib.Path(demo.demo_path).parent
+        / pathlib.Path(demo.demo_path).stem
+        / "videos"
     )
     # Ensure necessary directories exist
     default_constraints_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1077,10 +1403,8 @@ def get_constraint_data(
 
     # Create video of dataset if visualization needed
     if create_video and (
-            not default_video_dir.exists() or not any(default_video_dir.glob("*.mp4"))
+        not default_video_dir.exists() or not any(default_video_dir.glob("*.mp4"))
     ):
-        from robomimic.scripts.dataset_states_to_obs import dataset_states_to_obs
-
         from scripts.dataset.mp4_from_h5 import Config as MP4H5Config
         from scripts.dataset.mp4_from_h5 import generate_videos_from_hdf5
 
@@ -1105,7 +1429,7 @@ def get_constraint_data(
         )
         dataset_states_to_obs(dataset_states_to_obs_args)
         dataset_with_obs_path = (
-                pathlib.Path(demo.demo_path).parent / dataset_states_to_obs_args.output_name
+            pathlib.Path(demo.demo_path).parent / dataset_states_to_obs_args.output_name
         )
         generate_videos_from_hdf5(
             MP4H5Config(
@@ -1128,7 +1452,7 @@ def get_constraint_data(
                 f"You can refer to the video at {default_video_dir.as_posix()} for reference. "
             )
             assert (
-                    demo.demo_num is not None
+                demo.demo_num is not None
             ), "demo_num must be set to update interactions in demo.demo_path"
             update_demo_interactions(demo.demo_path, demo.demo_num, resp)
             interactions = parse_interactions(resp)
@@ -1183,12 +1507,12 @@ def get_constraint_data(
 
 
 def adjust_constraint_timesteps_for_collision_free_motion(
-        constraints: List[Dict],
-        env,
-        states: np.ndarray,
-        robot_body_name: str = "robot",
-        verbose: bool = False,
-        robot_weld_frame: str = "gripper0_right_eef",
+    constraints: List[Dict],
+    env,
+    states: np.ndarray,
+    robot_body_name: str = "robot",
+    verbose: bool = False,
+    robot_weld_frame: str = "gripper0_right_eef",
 ) -> List[Dict]:
     """Adjusts the first and last timesteps of constraints to ensure they are collision-free.
 
@@ -1217,7 +1541,7 @@ def adjust_constraint_timesteps_for_collision_free_motion(
         if "obj_to_parent_attachment_frame" in constraint:
             for obj, parent in constraint["obj_to_parent_attachment_frame"].items():
                 if (
-                        parent == robot_weld_frame
+                    parent == robot_weld_frame
                 ):  # Assumption: welded objects are attached here
                     welded_bodies.add(obj)
 
@@ -1244,12 +1568,12 @@ def adjust_constraint_timesteps_for_collision_free_motion(
             ]
             geom_pairs_to_check: List[Tuple] = [(robot_geoms, non_robot_geoms)]
             if (
-                    len(
-                        check_geom_collisions(
-                            model, data, geom_pairs_to_check, collision_activation_dist=0.03
-                        )
+                len(
+                    check_geom_collisions(
+                        model, data, geom_pairs_to_check, collision_activation_dist=0.03
                     )
-                    == 0
+                )
+                == 0
             ):
                 break
             new_start_idx -= 1
@@ -1307,15 +1631,15 @@ def adjust_constraint_timesteps_for_collision_free_motion(
 
 class ConstraintGenerator:
     def __init__(
-            self,
-            env,
-            demos: List[Demo],
-            target_env: Optional[CPEnv] = None,
-            src_env_w_rendering=None,
-            override_constraints: bool = False,
-            override_interactions: bool = False,
-            custom_constraints_path: Optional[str] = None,
-            demo_segmentation_type: Optional[Literal["distance-based", "llm-e2e"]] = None,
+        self,
+        env,
+        demos: List[Demo],
+        target_env: Optional[CPEnv] = None,
+        src_env_w_rendering=None,
+        override_constraints: bool = False,
+        override_interactions: bool = False,
+        custom_constraints_path: Optional[str] = None,
+        demo_segmentation_type: Optional[Literal["distance-based", "llm-e2e"]] = None,
     ):
         """
         Constraint generator for generating constraints from source demos.
@@ -1360,11 +1684,11 @@ class ConstraintGenerator:
         return constraint_sequences
 
     def _complete_constraint(
-            self,
-            constraint: Constraint,
-            demo: Demo,
-            env: CPEnv,
-            target_env: Optional[CPEnv] = None,
+        self,
+        constraint: Constraint,
+        demo: Demo,
+        env: CPEnv,
+        target_env: Optional[CPEnv] = None,
     ) -> Constraint:
         """
         Complete the constraint datastructure using additional information from the environment and source demo.
@@ -1383,9 +1707,9 @@ class ConstraintGenerator:
         src_obj_transform: Dict[str, Union[np.ndarray, Callable]] = {}
 
         if (
-                demo.env_args is not None
-                and demo.env_args.get("env_version", None) is not None
-                and demo.env_args["env_version"] == robosuite.__version__
+            demo.env_args is not None
+            and demo.env_args.get("env_version", None) is not None
+            and demo.env_args["env_version"] == robosuite.__version__
         ):
             env.env.reset_to({"states": demo.states[0], "model": demo.model_file})
             # TODO: maybe do sync_fixed_joint_objects_in_mjmodel except inverse i.e. get values from xml and update mjmodel
@@ -1409,8 +1733,8 @@ class ConstraintGenerator:
                 env.env.reset_to({"states": demo.states[timestep]})
                 object_name = object_names[0]
                 for (
-                        robot_link,
-                        keypoints_robot_frame,
+                    robot_link,
+                    keypoints_robot_frame,
                 ) in keypoints_robot_link_frame.items():
                     for keypoint in keypoints_robot_frame[timestep_idx]:
                         keypt_pose_src_frame = np.eye(4)
@@ -1582,7 +1906,7 @@ def axisangle2quat(vec):
 
 
 def visualize_robot_configuration(
-        robot_configuration: Configuration, env: CPEnv, q: np.ndarray
+    robot_configuration: Configuration, env: CPEnv, q: np.ndarray
 ):
     robot_configuration.update(q)
     env.env.env.robots[0].set_robot_joint_positions(q[:-2])
@@ -1591,10 +1915,10 @@ def visualize_robot_configuration(
 
 
 def visualize_robot_configuration_and_keypoints(
-        robot_configuration: Configuration,
-        env: CPEnv,
-        q: np.ndarray,
-        constraint: Constraint,
+    robot_configuration: Configuration,
+    env: CPEnv,
+    q: np.ndarray,
+    constraint: Constraint,
 ):
     robot_configuration.update(q)
     env.env.env.robots[0].set_robot_joint_positions(q[:-2])
@@ -1616,7 +1940,7 @@ def visualize_robot_configuration_and_keypoints(
 
 
 def set_mocap_pos_and_update_viewer(
-        env: CPEnv, mocap_pos: np.ndarray, update_viewer: bool = True
+    env: CPEnv, mocap_pos: np.ndarray, update_viewer: bool = True
 ):
     max_mocaps = min(env.env.env.sim.data.mocap_pos.shape[0], len(mocap_pos))
     env.env.env.sim.data.mocap_pos[:max_mocaps] = mocap_pos[:max_mocaps]
@@ -1662,7 +1986,7 @@ def remove_free_joints(xml_string: str) -> str:
 
 
 def weld_frames(
-        xml_string: str, frame_on_parent_F: str, frame_on_child_M: str, X_FM: np.ndarray
+    xml_string: str, frame_on_parent_F: str, frame_on_child_M: str, X_FM: np.ndarray
 ) -> str:
     root = ET.fromstring(xml_string)
     # Find the parent frame body
@@ -1753,14 +2077,14 @@ def attach_square_nut_to_gripper(xml_string: str, X_gripper_object: np.ndarray) 
 
 
 def create_passive_viewer(
-        model: MjModel,
-        data: MjData,
-        rate: float = 0.5,
-        run_physics: bool = False,
-        robot_configuration: Optional[Configuration] = None,
-        eef_configuration: Optional[Configuration] = None,
-        eef_pose: Optional[np.ndarray] = None,
-        **kwargs: Any,
+    model: MjModel,
+    data: MjData,
+    rate: float = 0.5,
+    run_physics: bool = False,
+    robot_configuration: Optional[Configuration] = None,
+    eef_configuration: Optional[Configuration] = None,
+    eef_pose: Optional[np.ndarray] = None,
+    **kwargs: Any,
 ) -> None:
     """
     Create a passive viewer for the given MuJoCo model and data.
@@ -1772,7 +2096,7 @@ def create_passive_viewer(
         **kwargs: Additional keyword arguments.
     """
     with viewer.launch_passive(
-            model=model, data=data, show_left_ui=False, show_right_ui=False
+        model=model, data=data, show_left_ui=False, show_right_ui=False
     ) as vis:
         mj_fwdPosition(model, data)  # Initialize positions
         qs = kwargs.get("qs", None)
@@ -1797,22 +2121,22 @@ def create_passive_viewer(
 
 
 def optimize_robot_configuration(
-        robot_configuration: IndexedConfiguration,
-        eef_configuration: Optional[IndexedConfiguration] = None,
-        eef_target: Optional[np.ndarray] = None,
-        eef_target_type: Literal["pose", "wxyz_xyz"] = "pose",
-        eef_frame_name: str = "gripper0_right_right_gripper",
-        eef_frame_type: str = "body",
-        update_gripper_qpos: bool = False,
-        global_opt_max_iter: int = 200,
-        global_opt_trials: int = 6,
-        start_q: Optional[np.ndarray] = None,  # used by sequential IK solvers
-        start_q_weights: Optional[np.ndarray] = None,
-        retract_q: Optional[np.ndarray] = None,
-        retract_q_weights: Optional[np.ndarray] = None,
-        optimization_type: Literal["scipy", "eef_interp_mink"] = "scipy",
-        eef_interp_mink_mp: Optional[EEFInterpMinkMotionPlanner] = None,
-        verbose: bool = False,
+    robot_configuration: IndexedConfiguration,
+    eef_configuration: Optional[IndexedConfiguration] = None,
+    eef_target: Optional[np.ndarray] = None,
+    eef_target_type: Literal["pose", "wxyz_xyz"] = "pose",
+    eef_frame_name: str = "gripper0_right_right_gripper",
+    eef_frame_type: str = "body",
+    update_gripper_qpos: bool = False,
+    global_opt_max_iter: int = 200,
+    global_opt_trials: int = 6,
+    start_q: Optional[np.ndarray] = None,  # used by sequential IK solvers
+    start_q_weights: Optional[np.ndarray] = None,
+    retract_q: Optional[np.ndarray] = None,
+    retract_q_weights: Optional[np.ndarray] = None,
+    optimization_type: Literal["scipy", "eef_interp_mink"] = "scipy",
+    eef_interp_mink_mp: Optional[EEFInterpMinkMotionPlanner] = None,
+    verbose: bool = False,
 ) -> Optional[np.ndarray]:
     """
     Optimize the robot configuration to reach the desired end-effector pose.
@@ -1838,7 +2162,7 @@ def optimize_robot_configuration(
             target_wxyz_xyz = eef_target
     else:
         assert (
-                target_wxyz_xyz is not None
+            target_wxyz_xyz is not None
         ), "Either eef_configuration or eef_target is required."
 
     original_q = robot_configuration.q[robot_configuration.robot_idxs].copy()
@@ -2024,7 +2348,7 @@ def optimize_robot_configuration(
 
 
 def generate_lift_actions(
-        last_action: List[float], retract_height: float = 0.04, retract_steps: int = 5
+    last_action: List[float], retract_height: float = 0.04, retract_steps: int = 5
 ) -> List[List[float]]:
     """
     Generate a list of retracting actions from the last action.
@@ -2060,7 +2384,7 @@ def generate_lift_actions(
 
 
 def generate_open_gripper_actions(
-        last_action: List[float], open_gripper_steps: int = 10
+    last_action: List[float], open_gripper_steps: int = 10
 ) -> List[List[float]]:
     new_actions = []
     for _ in range(open_gripper_steps):
@@ -2071,7 +2395,7 @@ def generate_open_gripper_actions(
 
 
 def generate_close_gripper_actions(
-        last_action: List[float], open_gripper_steps: int = 10
+    last_action: List[float], open_gripper_steps: int = 10
 ) -> List[List[float]]:
     new_actions = []
     for _ in range(open_gripper_steps):
@@ -2082,8 +2406,8 @@ def generate_close_gripper_actions(
 
 
 def get_scale_factor(
-        demo_obj_geoms_size: Dict[str, np.ndarray],
-        current_obj_geoms_size: Dict[str, np.ndarray],
+    demo_obj_geoms_size: Dict[str, np.ndarray],
+    current_obj_geoms_size: Dict[str, np.ndarray],
 ) -> np.ndarray:
     # Find the first key in both dicts that matches and has all non-zero components
     matching_key = next(
@@ -2091,8 +2415,8 @@ def get_scale_factor(
             key
             for key in demo_obj_geoms_size
             if key in current_obj_geoms_size
-               and np.all(demo_obj_geoms_size[key] > 0)
-               and np.all(current_obj_geoms_size[key] > 0)
+            and np.all(demo_obj_geoms_size[key] > 0)
+            and np.all(current_obj_geoms_size[key] > 0)
         ),
         None,
     )
@@ -2129,17 +2453,17 @@ def get_scale_factor(
 
 
 def optimize_robot_configuration_kp(
-        configuration: IndexedConfiguration,
-        target_keypoints: np.ndarray,
-        initial_pose: np.ndarray,
-        selected_indices: Optional[np.ndarray] = None,
-        verbose: bool = False,
-        max_iter: int = 200,
-        global_opt: bool = True,
-        local_opt: bool = True,
-        constraint_gripper_symmetry: bool = True,
-        qmin: Optional[np.ndarray] = None,
-        qmax: Optional[np.ndarray] = None,
+    configuration: IndexedConfiguration,
+    target_keypoints: np.ndarray,
+    initial_pose: np.ndarray,
+    selected_indices: Optional[np.ndarray] = None,
+    verbose: bool = False,
+    max_iter: int = 200,
+    global_opt: bool = True,
+    local_opt: bool = True,
+    constraint_gripper_symmetry: bool = True,
+    qmin: Optional[np.ndarray] = None,
+    qmax: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
     Optimize the (robot's) configuration to minimize keypoint distance while keeping close to the initial pose.
@@ -2237,17 +2561,17 @@ def optimize_robot_configuration_kp(
 
 
 def compute_X_W_eef_des(
-        constraint: Constraint,
-        obs: Dict,
-        robot_configuration: IndexedConfiguration,
-        eef_configuration: IndexedConfiguration,
-        X_obj0_transf: Optional[np.ndarray] = None,
-        X_obj1_transf: Optional[np.ndarray] = None,
-        X_eef_transf: Optional[np.ndarray] = None,
-        src_t_idx: int = 0,
-        eef_body_frame_name: str = "gripper0_right_right_gripper",
-        eef_site_frame_name: str = "gripper0_right_grip_site",
-        ignore_scaling: bool = False,
+    constraint: Constraint,
+    obs: Dict,
+    robot_configuration: IndexedConfiguration,
+    eef_configuration: IndexedConfiguration,
+    X_obj0_transf: Optional[np.ndarray] = None,
+    X_obj1_transf: Optional[np.ndarray] = None,
+    X_eef_transf: Optional[np.ndarray] = None,
+    src_t_idx: int = 0,
+    eef_body_frame_name: str = "gripper0_right_right_gripper",
+    eef_site_frame_name: str = "gripper0_right_grip_site",
+    ignore_scaling: bool = False,
 ) -> np.ndarray:
     """
     Compute the desired end-effector pose based on the constraint and observation data.
@@ -2293,7 +2617,7 @@ def compute_X_W_eef_des(
         # Extract necessary data for robot-object constraints
         task_relev_obj = constraint.obj_names[0]
         X_W_obj_demo = (
-                constraint.src_obj_pose[task_relev_obj][src_t_idx] @ X_obj0_transf
+            constraint.src_obj_pose[task_relev_obj][src_t_idx] @ X_obj0_transf
         )
         # Get the scale factor of the demo object and the current object
         demo_obj_geoms_size: Dict[str, np.ndarray] = constraint.src_obj_geoms_size[
@@ -2312,7 +2636,7 @@ def compute_X_W_eef_des(
 
         # Scale the original keypoints to the current object's scale
         scaled_keypoints = (
-                constraint.keypoints_obj_frame[task_relev_obj][src_t_idx] * scale_factor
+            constraint.keypoints_obj_frame[task_relev_obj][src_t_idx] * scale_factor
         )
 
         # Get the object's pose in the world frame
@@ -2348,12 +2672,12 @@ def compute_X_W_eef_des(
         X_eefsite_eef = np.linalg.inv(X_W_eefsite_curr) @ X_W_eef_curr
         X_W_eef_des = X_W_eefsite_des @ X_eefsite_eef
         X_W_eef_des = (
-                X_W_eef_des @ X_eef_transf
+            X_W_eef_des @ X_eef_transf
         )  # it is clear that this is incorrect then ...
 
         assert (
-                np.allclose(X_eef_transf, np.eye(4))
-                or np.allclose(X_eef_transf[:3, :3], R.from_euler("z", np.pi).as_matrix())
+            np.allclose(X_eef_transf, np.eye(4))
+            or np.allclose(X_eef_transf[:3, :3], R.from_euler("z", np.pi).as_matrix())
         ), "X_eef_transf must be either np.eye(4) or a rotation of 180 degrees about the x-axis"
 
         flip_eef = not np.allclose(X_eef_transf, np.eye(4), rtol=1e-5, atol=1e-8)
@@ -2398,7 +2722,7 @@ def compute_X_W_eef_des(
                 link_name: keypoints[src_t_idx]
                 for link_name, keypoints in constraint.keypoints_obj_frame.items()
                 if link_name in constraint.obj_to_parent_attachment_frame
-                   and constraint.obj_to_parent_attachment_frame[link_name] is not None
+                and constraint.obj_to_parent_attachment_frame[link_name] is not None
             }
 
             task_relev_obj_0 = constraint.obj_names[0]
@@ -2446,8 +2770,8 @@ def compute_X_W_eef_des(
                 ]
             )
             P_obj_target_0 = (X_obj0_transf @ pts_0_homog.T).T[
-                             ..., :3
-                             ]  # apply the obj0 transforms
+                ..., :3
+            ]  # apply the obj0 transforms
             # transforms mightn't be fully correct atm ...
             scaled_keypoints_0 = P_obj_target_0 * scale_factor_0
             link_to_kpts[task_relev_obj_0] = scaled_keypoints_0
@@ -2482,10 +2806,10 @@ def compute_X_W_eef_des(
 
         # Extract necessary data for object-object constraints
         X_W_obj0_demo = (
-                constraint.src_obj_pose[task_relev_obj_0][src_t_idx] @ X_obj0_transf
+            constraint.src_obj_pose[task_relev_obj_0][src_t_idx] @ X_obj0_transf
         )
         X_W_obj1_demo = (
-                constraint.src_obj_pose[task_relev_obj_1][src_t_idx] @ X_obj1_transf
+            constraint.src_obj_pose[task_relev_obj_1][src_t_idx] @ X_obj1_transf
         )
 
         X_obj0_obj1_demo = np.linalg.inv(X_W_obj0_demo) @ X_W_obj1_demo
@@ -2552,7 +2876,7 @@ def compute_X_W_eef_des(
 
 
 def rotation_about_point(
-        rot_axis: str, rot_param: float, origin: np.ndarray
+    rot_axis: str, rot_param: float, origin: np.ndarray
 ) -> np.ndarray:
     """
     Construct a 4x4 SE(3) matrix representing a rotation about a point in space.
@@ -2623,7 +2947,7 @@ def generate_se3_transforms(transforms: list[dict]) -> list[np.ndarray]:
 
 
 def find_best_transform(
-        constraint: Constraint, obs: Dict, robot_configuration, eef_configuration
+    constraint: Constraint, obs: Dict, robot_configuration, eef_configuration
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Find best object-centric constraint-satisfying symmetry transforms.
 
@@ -2687,8 +3011,8 @@ def find_best_transform(
                     eef_configuration.get_transform_frame_to_world(
                         "gripper0_right_grip_site", "site"
                     )
-                        .rotation()
-                        .wxyz
+                    .rotation()
+                    .wxyz
                 )
                 des_eef_quat_xyzw_site = des_eef_quat_wxyz_site[[1, 2, 3, 0]]
                 quat_diff_site = R.from_quat(
@@ -2709,19 +3033,19 @@ def find_best_transform(
 
 class CPPolicy:
     def __init__(
-            self,
-            constraint_sequences: List[List[Constraint]],
-            motion_planner: MotionPlanner,
-            robot_configuration: IndexedConfiguration,
-            eef_configuration: Optional[IndexedConfiguration] = None,
-            eef_interp_mink_motion_planer: Optional[
-                EEFInterpMinkMotionPlanner
-            ] = None,  # for IK solving via mink + interp
-            viz_robot_kpts: bool = False,
-            env: CPEnv = None,
-            verbose: bool = False,
-            original_xml: str = None,
-            ignore_scaling: bool = False,
+        self,
+        constraint_sequences: List[List[Constraint]],
+        motion_planner: MotionPlanner,
+        robot_configuration: IndexedConfiguration,
+        eef_configuration: Optional[IndexedConfiguration] = None,
+        eef_interp_mink_motion_planer: Optional[
+            EEFInterpMinkMotionPlanner
+        ] = None,  # for IK solving via mink + interp
+        viz_robot_kpts: bool = False,
+        env: CPEnv = None,
+        verbose: bool = False,
+        original_xml: str = None,
+        ignore_scaling: bool = False,
     ):
         self.motion_planner = motion_planner
         self.eef_interp_mink_motion_planer = eef_interp_mink_motion_planer
@@ -2778,15 +3102,15 @@ class CPPolicy:
             constraint.update_constraint(pose, transform, task_relevant_obj)
 
     def motion_plan(
-            self,
-            obs: Dict[str, Any],
-            future_configurations: Optional[np.ndarray] = None,
-            future_actions: Optional[np.ndarray] = None,
-            motion_planner_type: Literal[
-                "eef_interp", "sampling", "curobo", "eef_interp_mink", "eef_interp_curobo"
-            ] = "eef_interp",  # from motion_planner itself
-            manual_clip_joint_limits: bool = False,
-            visualize_failures: bool = False,
+        self,
+        obs: Dict[str, Any],
+        future_configurations: Optional[np.ndarray] = None,
+        future_actions: Optional[np.ndarray] = None,
+        motion_planner_type: Literal[
+            "eef_interp", "sampling", "curobo", "eef_interp_mink", "eef_interp_curobo"
+        ] = "eef_interp",  # from motion_planner itself
+        manual_clip_joint_limits: bool = False,
+        visualize_failures: bool = False,
     ) -> PlanningResult:
         """Motion plan to the start of the constraint.
 
@@ -2969,7 +3293,7 @@ class CPPolicy:
                 batch_size=batch_size,
             )
             b = time.time()
-            logging.info(f"update_env time: {b - a}")
+            logging.info(f"update_env time: {b-a}")
             kin_state = self.motion_planner.curobo_planner.motion_gen.ik_solver.fk(
                 torch.tensor(
                     future_configurations[0], device="cuda", dtype=torch.float32
@@ -2997,7 +3321,7 @@ class CPPolicy:
                         0,
                     ]
                 ),
-                q_gripper_start=q_start[self.motion_planner.dof:],
+                q_gripper_start=q_start[self.motion_planner.dof :],
                 ee_goal_curobo=ee_goal_curobo,
                 retract_q_weights=np.array([2, 2, 1, 1, 1, 0.1, 0.1, 0, 0]),
                 curobo_goal_type=self.motion_planner.curobo_planner.goal_type,
@@ -3007,14 +3331,14 @@ class CPPolicy:
 
             # check that X_base_goal is the same as X_ee_goal
             if (
-                    qs is None
-                    or (
+                qs is None
+                or (
                     not isinstance(motion_plan_result, bool)
                     and not motion_plan_result.success.any().item()
-            )
-                    or (
+                )
+                or (
                     isinstance(motion_plan_result, bool) and motion_plan_result is False
-            )
+                )
             ):
                 self.robot_configuration.update(q_start)
                 if visualize_failures:
@@ -3091,15 +3415,15 @@ class CPPolicy:
         )
 
     def solve_constraint(
-            self,
-            constraint: Constraint,
-            obs: Dict[str, Any],
-            dummy_actions: bool = False,
-            copy_constraint_actions: bool = True,
-            ik_type: Literal["kpts_to_robot_q", "kpts_to_eef_to_q"] = "kpts_to_eef_to_q",
-            fallback_to_kpts_to_robot_q: bool = True,
-            solve_first_n_steps: Optional[List[int]] = None,
-            # currently, no optimization for kpts_to_eef
+        self,
+        constraint: Constraint,
+        obs: Dict[str, Any],
+        dummy_actions: bool = False,
+        copy_constraint_actions: bool = True,
+        ik_type: Literal["kpts_to_robot_q", "kpts_to_eef_to_q"] = "kpts_to_eef_to_q",
+        fallback_to_kpts_to_robot_q: bool = True,
+        solve_first_n_steps: Optional[List[int]] = None,
+        # currently, no optimization for kpts_to_eef
     ) -> PlanningResult:
         """Generate a plan based on the updated constraint info.
         Args:
@@ -3164,7 +3488,7 @@ class CPPolicy:
             else len(constraint.timesteps)
         )
         assert (
-                solve_first_n_steps <= len(constraint.timesteps)
+            solve_first_n_steps <= len(constraint.timesteps)
         ), "constraint_steps should be less than or equal to the number of timesteps in the constraint"
         for t_idx in range(solve_first_n_steps):
             # # how to add in symmetry here? if doing discree option per symmetry, would get exponential explosion
@@ -3190,7 +3514,7 @@ class CPPolicy:
                 )
                 # Scale the original keypoints to the current object's scale
                 P_obj_target = (
-                        constraint.keypoints_obj_frame[task_relev_obj][t_idx] * scale_factor
+                    constraint.keypoints_obj_frame[task_relev_obj][t_idx] * scale_factor
                 )
                 P_W_target = transform_keypoints(
                     P_obj_target, obs[f"{constraint.obj_names[0]}_pose"] @ X_obj0_transf
@@ -3201,7 +3525,7 @@ class CPPolicy:
                     link_name: keypoints[t_idx]
                     for link_name, keypoints in constraint.keypoints_obj_frame.items()
                     if link_name in constraint.obj_to_parent_attachment_frame
-                       and constraint.obj_to_parent_attachment_frame[link_name] is not None
+                    and constraint.obj_to_parent_attachment_frame[link_name] is not None
                 }
                 # get object keypoints in world frame: will be used in optimization q* = argmin_q ||P_W_goal - P_W_robot_kp(q)||^2
                 P_obj_target = np.array(
@@ -3318,7 +3642,7 @@ class CPPolicy:
                     t_idx
                 ]  # hack for now to test if we needed to match actions rather than states
             if (
-                    optimized_q is None and fallback_to_kpts_to_robot_q
+                optimized_q is None and fallback_to_kpts_to_robot_q
             ) or ik_type == "kpts_to_robot_q":
                 logging.info(f"Falling back to IK on keypoints for t_idx: {t_idx}")
                 # TODO: set up IK optimization for eef pose. For now, directly provide eef pose for curobo's expected frame
@@ -3420,14 +3744,14 @@ class CPPolicy:
         # return constraint.is_satisfied()
 
     def _update_robot_configuration(
-            self,
-            robot_configuration: IndexedConfiguration,
-            eef_configuration: Optional[IndexedConfiguration] = None,
-            env: Optional[CPEnv] = None,
-            obs: Dict[str, Any] = None,
-            constraint: Optional[Constraint] = None,
-            do_remove_free_joints: bool = False,
-            q_eef: Optional[np.ndarray] = None,
+        self,
+        robot_configuration: IndexedConfiguration,
+        eef_configuration: Optional[IndexedConfiguration] = None,
+        env: Optional[CPEnv] = None,
+        obs: Dict[str, Any] = None,
+        constraint: Optional[Constraint] = None,
+        do_remove_free_joints: bool = False,
+        q_eef: Optional[np.ndarray] = None,
     ) -> None:
         """
         Update the robot configuration based on the current observation and constraint.
@@ -3481,8 +3805,8 @@ class CPPolicy:
         if eef_configuration is not None:
             # get original gripper qpos
             qpos_gripper = robot_configuration.q[robot_configuration.robot_idxs][
-                           -2:
-                           ]  # hack
+                -2:
+            ]  # hack
             q_gripper = robot_configuration.get_transform_frame_to_world(
                 "gripper0_right_right_gripper", "body"
             ).wxyz_xyz
@@ -3493,8 +3817,8 @@ class CPPolicy:
                 robot_configuration.model,
                 robot_configuration.data,
                 gripper_joint_names=env.env.env.robots[0]
-                    .robot_model.grippers["robot0_right_hand"]
-                    .joints,
+                .robot_model.grippers["robot0_right_hand"]
+                .joints,
             )
             self.eef_configuration = new_eef_configuration
             self.eef_configuration.update(q_gripper)
@@ -3640,11 +3964,10 @@ def anonymize_model_file_paths(xml_str: str) -> str:
                 # ordering matters: mimicgen paths might have robosuite, but not vice-versa
                 if key in original:
                     idx = original.index(key)
-                    elem.attrib["file"] = "/path/to" + original[idx - 1:]
+                    elem.attrib["file"] = "/path/to" + original[idx - 1 :]
                     break
 
     return ET.tostring(root, pretty_print=True, encoding="unicode")
-
 
 @dataclass
 class SystemNoiseConfig:
@@ -3659,22 +3982,22 @@ class SystemNoiseConfig:
     skip_noise_for_last_stage: bool = True
     """Whether to skip adding noise during the last constraint segment execution"""
 
-
 class DemoGenerator:
     def __init__(
-            self,
-            env: Union[CPEnv, Any],
-            policy: CPPolicy,
-            use_reset_near_constraint: bool = False,
-            constraint_selection_method: Literal[
-                "random", "first", "second", "last"
-            ] = "random",
-            use_reset_to_state: bool = False,
-            reset_state_demo_path: Optional[str] = None,
-            reset_state_demo_idx: Optional[int] = None,
-            demo_src_env: Optional[CPEnv] = None,
-            anonymize_model_file_paths: bool = True,
-            total_target_demos=100,
+        self,
+        env: Union[CPEnv, Any],
+        policy: CPPolicy,
+        use_reset_near_constraint: bool = False,
+        constraint_selection_method: Literal[
+            "random", "first", "second", "last"
+        ] = "random",
+        use_reset_to_state: bool = False,
+        reset_state_demo_path: Optional[str] = None,
+        reset_state_demo_idx: Optional[int] = None,
+        demo_src_env: Optional[CPEnv] = None,
+        anonymize_model_file_paths: bool = True,
+        total_target_demos=100,
+        curriculum_manager=None,
     ):
         self.env = env
         self.policy = policy
@@ -3685,16 +4008,17 @@ class DemoGenerator:
         self.reset_state_demo_idx = reset_state_demo_idx
         self.demo_src_env = demo_src_env
         self.anonymize_model_file_paths = anonymize_model_file_paths
+        self.curriculum_manager = curriculum_manager
 
     def reset_near_constraint(
-            self,
-            constraint: Constraint,
-            pos_bounds: Tuple[
-                Tuple[float, float], Tuple[float, float], Tuple[float, float]
-            ],
-            max_rot_angle: float,
-            randomize_gripper: bool = False,
-            verbose: bool = False,
+        self,
+        constraint: Constraint,
+        pos_bounds: Tuple[
+            Tuple[float, float], Tuple[float, float], Tuple[float, float]
+        ],
+        max_rot_angle: float,
+        randomize_gripper: bool = False,
+        verbose: bool = False,
     ) -> Dict[str, Any]:
         """
         Resets the environment near a given source demo constraint state by sampling pose variations.
@@ -3813,7 +4137,7 @@ class DemoGenerator:
         if constraint.constraint_type == "object-object":
             X_W_obj = obs[f"{constraint.obj_names[0]}_pose"]
             X_eef_obj = (
-                    np.linalg.inv(X_W_eef_curr) @ X_W_obj
+                np.linalg.inv(X_W_eef_curr) @ X_W_obj
             )  # relevant pose between hand and object
 
         max_samples: int = 100
@@ -3857,7 +4181,7 @@ class DemoGenerator:
             # get names related to the robot
             geom_pairs_to_check: List[Tuple] = [(robot_geoms, non_robot_geoms)]
             is_collision = (
-                    len(check_geom_collisions(model, data, geom_pairs_to_check)) > 0
+                len(check_geom_collisions(model, data, geom_pairs_to_check)) > 0
             )
             if not is_collision:
                 if verbose:
@@ -3915,9 +4239,9 @@ class DemoGenerator:
                 # is possible
                 continue
 
-            q[self.policy.motion_planner.dof:] = obs["robot_q"][
-                                                 self.policy.motion_planner.dof:
-                                                 ]
+            q[self.policy.motion_planner.dof :] = obs["robot_q"][
+                self.policy.motion_planner.dof :
+            ]
             obs["robot_q"] = q
             break
 
@@ -3935,7 +4259,7 @@ class DemoGenerator:
             q[: self.policy.motion_planner.dof]
         )
         self.env.env.env.robots[0].set_gripper_joint_positions(
-            q[self.policy.motion_planner.dof:]
+            q[self.policy.motion_planner.dof :]
         )
         if constraint.constraint_type == "object-object":
             X_W_obj = obs[f"{constraint.obj_names[0]}_pose"]
@@ -3956,11 +4280,11 @@ class DemoGenerator:
         return self.env.get_observation()  # TODO(klin): check if get_state is correct
 
     def generate_demo(
-            self,
-            gen_single_stage_only: bool = False,
-            store_single_stage_only: bool = False,
-            store_single_stage_max_extra_steps: int = 0,
-            system_noise_cfg: SystemNoiseConfig = field(default_factory=SystemNoiseConfig)
+        self,
+        gen_single_stage_only: bool = False,
+        store_single_stage_only: bool = False,
+        store_single_stage_max_extra_steps: int = 0,
+        system_noise_cfg: SystemNoiseConfig = field(default_factory=SystemNoiseConfig)
     ) -> Dict[str, Any]:
         obss, actions, dones, rewards, infos, states = [], [], [], [], [], []
         constraint_sequence: List[Constraint] = []
@@ -3968,6 +4292,69 @@ class DemoGenerator:
 
         # 1. 物理环境重置
         obs = self.env.reset()
+
+        # =========== [新增逻辑开始] 位置修正 ===========
+        train_initial_pos = None  # 用于后续训练的数据
+
+        # 仅在非 Reset-Near 模式且有课程管理器时启用
+        if self.curriculum_manager is not None and not self.use_reset_near_constraint and not self.use_reset_to_state:
+            # 假设我们要操作的目标物体是 'SquareNut_main' (或者是从 self.env 获取的关键物体)
+            # 你可能需要根据具体任务修改这个名字，或者从 policy.current_constraint 获取
+            target_obj_name = "SquareNut_main"
+
+            try:
+                # 1. 获取环境随机生成的初始位置
+                current_pose = self.env.get_obj_pose(target_obj_name)
+                raw_pos = current_pose[:3, 3].copy()
+
+                # 2. 调用课程管理器获取新位置 (Random 或 AI 修正)
+                new_pos, _ = self.curriculum_manager.get_next_position(raw_pos)
+
+                # 3. 将新位置应用回环境
+                new_pose = current_pose.copy()
+                new_pose[:3, 3] = new_pos
+                self.env.set_obj_pose(target_obj_name, new_pose)
+
+                # ============ [修正] 安全检查 ============
+                # 强制让物理引擎更新一下，检查是否发生了严重碰撞
+                try:
+                    # 1. 获取最底层的 sim 对象 (解决 'EnvRobosuite' object has no attribute 'sim' 报错)
+                    # 层级: CPEnv -> EnvRobosuite -> RobosuiteEnv -> sim
+                    if hasattr(self.env.env, "sim"):
+                        sim = self.env.env.sim
+                    elif hasattr(self.env.env, "env") and hasattr(self.env.env.env, "sim"):
+                        sim = self.env.env.env.sim
+                    else:
+                        # 兜底：如果找不到 sim，就跳过检查，防止报错
+                        raise AttributeError("Could not find .sim in env wrappers")
+
+                    # 2. 前向推进一步检测碰撞
+                    sim.forward()
+
+                    # 3. 使用 CPEnv 的静态方法检查碰撞
+                    # 注意：这里的 model 和 data 也要从 sim 里取
+                    if CPEnv.is_collision(sim.model._model, sim.data._data):
+                        # print(f"⚠️ [Safety] Generated position caused collision. Resetting to default.")
+                        # 如果碰撞了，为了不让程序崩掉，我们把物体放回原处
+                        self.env.set_obj_pose(target_obj_name, current_pose)
+                        new_pos = raw_pos # 记录回去的是原始位置
+
+                except Exception as e:
+                    # 这里的 print 可以保留，用于调试，现在应该不会再报 AttributeError 了
+                    # print(f"Collision check warning: {e}")
+                    pass
+                # ========================================
+
+                # 4. 必须重新获取 obs 和 state，因为物体位置变了！
+                obs = self.env.get_observation()
+
+                # 记录用于训练
+                train_initial_pos = new_pos
+
+            except Exception as e:
+                logging.warning(f"Failed to apply curriculum position: {e}")
+        # =========== [新增逻辑结束] ===========
+
         state = self.env.get_state()
 
         # 2. 根据配置决定具体的重置策略 (reset_near_constraint 或 reset_to_state)
@@ -3988,7 +4375,7 @@ class DemoGenerator:
                 self.policy.current_constraint_idx = 2
             elif self.constraint_selection_method == "last":
                 self.policy.current_constraint_idx = (
-                        len(self.policy.current_constraint_sequence) - 1
+                    len(self.policy.current_constraint_sequence) - 1
                 )
 
             obs = self.reset_near_constraint(
@@ -4102,8 +4489,8 @@ class DemoGenerator:
             n_constraint_segment_actions = self.policy.curr_constraint_steps
             in_constraint_segment = actions_left < n_constraint_segment_actions
             is_last_constraint_segment = (
-                    self.policy.current_constraint_idx
-                    == len(self.policy.current_constraint_sequence) - 1
+                self.policy.current_constraint_idx
+                == len(self.policy.current_constraint_sequence) - 1
             )
 
             # 添加噪声 (System Noise)
@@ -4167,13 +4554,24 @@ class DemoGenerator:
 
         success = (rewards[-1] == 1) if rewards else False
 
+        # =========== [新增逻辑开始] 数据闭环训练 ===========
+        if self.curriculum_manager is not None and train_initial_pos is not None:
+            # 告诉 AI：这个起始位置最终是成功了还是失败了
+            self.curriculum_manager.guide.update_model(train_initial_pos, success)
+            # 增加计数，推进课程难度
+            self.curriculum_manager.increment_count()
+
+            if self.policy.verbose:
+                print(f"[Curriculum] Updated model. Success: {success}, Count: {self.curriculum_manager.generated_count}")
+        # =========== [新增逻辑结束] ===========
+
         # quirk of mujoco based envs that directly model the mjmodel
         if isinstance(self.env, CPEnvRobomimic):
             model = update_fixed_joint_objects_in_xml(self.env.env.env.sim.model, model)
 
         if store_single_stage_only and len(constraint_sequence) > 0:
             assert (
-                    store_single_stage_max_extra_steps >= 0
+                store_single_stage_max_extra_steps >= 0
             ), "store_single_stage_max_extra_steps must be non-negative"
             constraint_last_tstep = constraint_sequence[0].timesteps[-1]
             max_steps = min(
@@ -4204,7 +4602,6 @@ class DemoGenerator:
             "constraint_sequence": constraint_sequence,
         }
         return episode_data
-
 
 def save_demo(demo: Dict[str, Any], save_path: str, env_meta: str):
     # Open the HDF5 file in write mode
@@ -4259,7 +4656,7 @@ def save_demo(demo: Dict[str, Any], save_path: str, env_meta: str):
 
 
 def save_images(
-        images: List[np.ndarray], folder_path: str, save_as_mp4: bool = False, fps: int = 20
+    images: List[np.ndarray], folder_path: str, save_as_mp4: bool = False, fps: int = 20
 ):
     if len(images) == 0 or images[0] is None:
         logging.info("No images to save.")
@@ -4305,7 +4702,7 @@ def extract_git_installed_packages(requirements_content: str) -> list:
 
 
 def export_conda_environment(
-        env_name: str, exclude_packages: list, env_yaml_path: str
+    env_name: str, exclude_packages: list, env_yaml_path: str
 ) -> str:
     """Export Conda environment to environment.yaml excluding specified packages."""
     conda_export_command = "conda env export --no-builds"
@@ -4356,9 +4753,9 @@ class LoggingConfig:
         if self.logging_path is None:
             # add datetime for unique logging
             self.logging_path = (
-                    pathlib.Path("logs")
-                    / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-                    / "demo-gen.log"
+                pathlib.Path("logs")
+                / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+                / "demo-gen.log"
             )
 
         logging.getLogger("curobo").setLevel(logging.WARNING)
@@ -4524,8 +4921,8 @@ class Config:
             )
         if self.motion_planner_type == "curobo":
             assert (
-                    self.curobo_goal_type == "pose_wxyz_xyz"
-                    or self.curobo_goal_type == "joint"
+                self.curobo_goal_type == "pose_wxyz_xyz"
+                or self.curobo_goal_type == "joint"
             ), (
                 "Curobo motion planner requires goal type 'pose_wxyz_xyz' or 'joint' for now. "
                 "Please update motion planner configs."
@@ -4534,8 +4931,8 @@ class Config:
     def validate_reset_to_state_configs(self):
         if self.use_reset_to_state:
             assert (
-                    self.reset_state_demo_path is not None
-                    and self.reset_state_demo_idx is not None
+                self.reset_state_demo_path is not None
+                and self.reset_state_demo_idx is not None
             ), "If 'use_reset_to_state' is True, 'reset_state_demo_path' and 'reset_state_demo_idx' must be provided."
         if self.reset_state_demo_path is not None:
             assert (
@@ -4616,11 +5013,11 @@ class Config:
 
 
 def get_eef_configuration(
-        model_xml: str,
-        mj_model: mujoco.MjModel,
-        mj_data: mujoco.MjData,
-        return_model_only: bool = False,
-        gripper_joint_names: List[str] = None,
+    model_xml: str,
+    mj_model: mujoco.MjModel,
+    mj_data: mujoco.MjData,
+    return_model_only: bool = False,
+    gripper_joint_names: List[str] = None,
 ) -> Union[IndexedConfiguration, mujoco.MjModel]:
     """
     Generates the end-effector configuration from the given model XML (which includes the full robot and environment).
@@ -4664,11 +5061,11 @@ def get_eef_configuration(
 
 
 def get_robot_configuration(
-        model_xml: str,
-        mj_model: mujoco.MjModel,
-        mj_data: mujoco.MjData,
-        return_model_only: bool = False,
-        robot_joint_names: List[str] = None,
+    model_xml: str,
+    mj_model: mujoco.MjModel,
+    mj_data: mujoco.MjData,
+    return_model_only: bool = False,
+    robot_joint_names: List[str] = None,
 ) -> Union[IndexedConfiguration, mujoco.MjModel]:
     """
     Generates the robot configuration from the given model XML (which includes the full robot and environment).
@@ -4832,15 +5229,15 @@ def main(cfg: Config):
         env.env.env.sim.model._model,
         env.env.env.sim.data._data,
         robot_joint_names=env.env.env.robots[0].robot_model.joints
-                          + env.env.env.robots[0].robot_model.grippers["robot0_right_hand"].joints,
+        + env.env.env.robots[0].robot_model.grippers["robot0_right_hand"].joints,
     )
     eef_configuration = get_eef_configuration(
         original_xml,
         env.env.env.sim.model._model,
         env.env.env.sim.data._data,
         gripper_joint_names=env.env.env.robots[0]
-            .robot_model.grippers["robot0_right_hand"]
-            .joints,
+        .robot_model.grippers["robot0_right_hand"]
+        .joints,
     )
     cp_policy = CPPolicy(
         constraint_sequences,
@@ -4854,6 +5251,30 @@ def main(cfg: Config):
         ignore_scaling=cfg.ignore_obj_geom_scaling
     )
 
+    # =========== [新增] 实例化课程管理器 ===========
+    # 假设物体位置是 3 维 (x, y, z)
+    position_guide = PositionFeasibilityGuide(object_dim=3, device='cuda' if torch.cuda.is_available() else 'cpu')
+
+    # 这里的 total_target_demos 应该与你命令行参数 cfg.n_demos 一致
+    curriculum_manager = CurriculumManager(position_guide, total_target_demos=cfg.n_demos)
+    weights_dir = pathlib.Path(f"model_weights/{cfg.env_name}")
+    ckpt_path = weights_dir / "position_guide_checkpoint.pth"
+
+    # 如果加载成功，buffer 里就有几百条数据了，
+    # CurriculumManager.get_next_position 里的 if total < warmup 判断会自动失效，
+    # 从而直接跳过 Warmup 阶段！
+    # 加载逻辑
+    # 这里的 reset_curriculum=True 意味着：
+    # "即使我以前跑过，这次我也希望利用训练好的模型，从 range=0.05 开始慢慢扩大范围生成"
+    # 这样既保证了多样性（从小范围开始），又保证了成功率（模型已训练）
+    load_checkpoint(ckpt_path, position_guide, curriculum_manager, reset_curriculum=True)
+    # 打印确认一下当前的策略
+    print(f"🚀 Starting Run Strategy:")
+    print(f"   - Target Demos: {cfg.n_demos}")
+    print(f"   - Difficulty Climb: Range {curriculum_manager.current_range_limit:.3f} -> {curriculum_manager.max_range:.3f}")
+    print(f"   - Exploration Decay: Epsilon {curriculum_manager.epsilon:.2f} -> {curriculum_manager.epsilon_min:.2f}")
+    # ============================================
+
     # get a motion planning model where I can attach objects to the env if needed
     demo_generator = DemoGenerator(
         env,
@@ -4864,6 +5285,7 @@ def main(cfg: Config):
         reset_state_demo_path=cfg.reset_state_demo_path,
         reset_state_demo_idx=cfg.reset_state_demo_idx,
         demo_src_env=src_env,  # currently used for resetting to state; mightn't need after getting poses from demos
+        curriculum_manager=curriculum_manager,
     )
 
     trials = 0
@@ -4886,12 +5308,13 @@ def main(cfg: Config):
         )
         intermediate_folder = "successes" if demo["success"] else "failures"
         save_path = (
-                cfg.save_dir
-                / intermediate_folder
-                / (datetime.now().strftime("%H-%M-%S-%f") + ".hdf5")
+            cfg.save_dir
+            / intermediate_folder
+            / (datetime.now().strftime("%H-%M-%S-%f") + ".hdf5")
         )
 
         save_demo(demo, save_path.as_posix(), env_meta)
+        demo["observations"] = []
         demos.append(demo)
         if demo["success"]:
             success_demo_save_paths.append(save_path)
@@ -4900,6 +5323,18 @@ def main(cfg: Config):
 
         trials += 1
         n_successes += int(demo["success"])
+
+        # ============ [在此处添加显示代码] ============
+        n_failures = trials - n_successes
+
+        # 打印带颜色的统计信息，让你一眼就能看到
+        if demo["success"]:
+            print(f"\n✅ [SUCCESS] Demo Generated! | Successes: {n_successes} | Failures: {n_failures} | Total: {trials}")
+        else:
+            # 如果你也想看失败的计数，可以加上这一行
+            print(f"\n❌ [FAILURE] Demo Failed...  | Successes: {n_successes} | Failures: {n_failures} | Total: {trials}")
+        # ============================================
+
         if cfg.require_n_demos and n_successes == cfg.n_demos:
             break
 
@@ -4923,22 +5358,22 @@ def main(cfg: Config):
     merge_demo_save_path = cfg.merge_demo_save_path
     if success_demo_save_paths:
         save_path = pathlib.Path(success_demo_save_paths[0].parent) / (
-                pathlib.Path(success_demo_save_paths[0]).stem + ".hdf5"
+            pathlib.Path(success_demo_save_paths[0]).stem + ".hdf5"
         )
         total_demos = count_total_demos(success_demo_save_paths)
         if merge_demo_save_path is None:
             merge_demo_save_path = pathlib.Path(save_path).parent / (
-                    str(pathlib.Path(save_path).stem)
-                    + f"_{total_demos}demos"
-                    + str(pathlib.Path(save_path).suffix)
+                str(pathlib.Path(save_path).stem)
+                + f"_{total_demos}demos"
+                + str(pathlib.Path(save_path).suffix)
             )
         merge_demo_files(success_demo_save_paths, save_path=merge_demo_save_path)
 
     if fail_demo_save_paths:
         merge_failure_demo_save_path = pathlib.Path(merge_demo_save_path).parent / (
-                str(pathlib.Path(merge_demo_save_path).stem)
-                + "_failures"
-                + str(pathlib.Path(merge_demo_save_path).suffix)
+            str(pathlib.Path(merge_demo_save_path).stem)
+            + "_failures"
+            + str(pathlib.Path(merge_demo_save_path).suffix)
         )
         merge_demo_files(fail_demo_save_paths, save_path=merge_failure_demo_save_path)
         # always save failure videos
@@ -4953,9 +5388,9 @@ def main(cfg: Config):
 
             intermediate_folder = "failures"
             save_video_path = (
-                    cfg.save_dir
-                    / intermediate_folder
-                    / f"cpgen-mp={cfg.motion_planner_type}-seed={cfg.seed}-demo={i}.mp4"
+                cfg.save_dir
+                / intermediate_folder
+                / f"cpgen-mp={cfg.motion_planner_type}-seed={cfg.seed}-demo={i}.mp4"
             )
 
             video_writer = imageio.get_writer(save_video_path, fps=20)
@@ -5011,15 +5446,13 @@ def main(cfg: Config):
             with h5py.File(merge_demo_save_path, "a") as file:
                 file.attrs["wandb_run_url"] = cfg.wandb_run_url
 
-    from robomimic.scripts.dataset_states_to_obs import dataset_states_to_obs
-
     dataset_states_to_obs(dataset_states_to_obs_args)
     # Append wandb run id to merge_demo_save_path obs's hdf5 file
     if merge_demo_save_path is not None and cfg.wandb_run_url is not None:
         with h5py.File(
-                pathlib.Path(merge_demo_save_path).parent
-                / f"{str(pathlib.Path(merge_demo_save_path).stem)}_obs.hdf5",
-                "a",
+            pathlib.Path(merge_demo_save_path).parent
+            / f"{str(pathlib.Path(merge_demo_save_path).stem)}_obs.hdf5",
+            "a",
         ) as file:
             file.attrs["wandb_run_url"] = cfg.wandb_run_url
 
@@ -5034,6 +5467,20 @@ def main(cfg: Config):
     #         fps=20,
     #     )
     # )
+
+    # ================= [修改 1] 保存模型与数据状态 =================
+    # 1. 构建保存目录
+    weights_dir = pathlib.Path(f"model_weights/{cfg.env_name}")
+    weights_dir.mkdir(parents=True, exist_ok=True)
+
+    ckpt_path = weights_dir / "position_guide_checkpoint.pth"
+
+    # 2. 调用保存函数 (我们需要在下面实现 save_checkpoint)
+    # 这里我们不仅仅保存 model_state_dict，而是保存整个“大脑”的状态
+    save_checkpoint(ckpt_path, position_guide, curriculum_manager)
+
+    print(f"✅ Checkpoint saved to: {ckpt_path}")
+    # ============================================================
 
 
 if __name__ == "__main__":
