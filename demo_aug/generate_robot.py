@@ -323,17 +323,17 @@ class CPEnv:
             try:
                 # 获取当前关注的目标物体名称
                 target_name = self.current_constraint.obj_names[0]
-
+                
                 # [几何信息] 获取目标物体的绝对坐标
                 # 注意：这里直接取物理中心，不做人为偏移，保持数据的通用性
                 target_pos = self.env.env.sim.data.get_body_xpos(target_name).copy()
-
+                
                 # [几何信息] 计算 3D 相对矢量 (Target - EEF)
                 rel_vec = (target_pos - eef_pos).astype(np.float32)
 
                 # [接触信息] 准备工作：获取目标物体的 Body ID
                 target_body_id = self.env.env.sim.model.body_name2id(target_name)
-
+                
                 # [接触信息] 准备工作：筛选出机器人夹爪/手部的所有几何体 ID
                 robot_geom_ids = set()
                 # 遍历所有几何体，增加非空判断以修复 "NoneType" 报错
@@ -341,31 +341,31 @@ class CPEnv:
                     if geom_name and ("finger" in geom_name or "hand" in geom_name):
                         geom_id = self.env.env.sim.model.geom_name2id(geom_name)
                         robot_geom_ids.add(geom_id)
-
+                
                 # [接触信息] 遍历仿真器当前的接触点列表
                 for i in range(self.env.env.sim.data.ncon):
                     contact = self.env.env.sim.data.contact[i]
                     g1, g2 = contact.geom1, contact.geom2
-
+                    
                     # 检查碰撞双方的归属
                     g1_is_robot = g1 in robot_geom_ids
                     g2_is_robot = g2 in robot_geom_ids
-
+                    
                     # 获取接触几何体所属的 Body ID
                     g1_body = self.env.env.sim.model.geom_bodyid[g1]
                     g2_body = self.env.env.sim.model.geom_bodyid[g2]
-
+                    
                     # 判断逻辑：一方是机器人，另一方是目标物体
                     is_relevant_contact = False
                     if g1_is_robot and g2_body == target_body_id:
                         is_relevant_contact = True
                     elif g2_is_robot and g1_body == target_body_id:
                         is_relevant_contact = True
-
+                        
                     if is_relevant_contact:
                         is_contacting = True
                         break # 只要发现哪怕一个接触点，就视为已接触
-
+                
                 # [接触信息] 如果发生接触，读取目标受到的外力合力
                 if is_contacting:
                     # cfrc_ext 包含了该 Body 受到的外部 6D 力 (Fx, Fy, Fz, Tx, Ty, Tz)
@@ -381,12 +381,12 @@ class CPEnv:
         # 注意：这里只存数值类型 (float32)，坚决不存字符串，避免 HDF5 保存报错
         obs["privileged_target_pos"] = target_pos.astype(np.float32)
         obs["privileged_target_rel_pos"] = rel_vec.astype(np.float32)
-
+        
         # 存入接触状态 (1.0 或 0.0)
         obs["privileged_is_contact"] = np.array([1.0 if is_contacting else 0.0], dtype=np.float32)
         # 存入接触力大小 (连续值)
         obs["privileged_contact_force"] = np.array([contact_force], dtype=np.float32)
-
+        
         for obj_name in self.possible_task_relevant_obj_names:
             obs[obj_name + "_pose"] = self.get_obj_pose(obj_name)
             obs[obj_name + "_geoms_size"] = self.get_obj_geoms_size(obj_name)
@@ -3799,6 +3799,55 @@ class DemoGenerator:
         constraint_sequence: List[Constraint] = []
         timestep = 0
         obs = self.env.reset()
+
+        # ==============================================================================
+        # 【新增代码 START】: 强制手动随机化物体位置 (Manual Randomization Override)
+        # ==============================================================================
+        # 仅在不是 "reset_near" 或 "reset_to_state" 的普通生成模式下执行
+        if not self.use_reset_near_constraint and not self.use_reset_to_state:
+            try:
+                # 1. 定义随机范围 (例如: +/- 15cm)
+                # 你可以根据需要把这个写死，或者从 cfg 读取
+                range_limit = 0.15 
+                
+                # 2. 确定目标物体名称
+                # 对于 NutAssemblySquare 任务，主物体通常叫 "SquareNut_main"
+                # 如果是其他任务，请修改这个名字 (例如 "Cube_main", "Can_main")
+                target_obj_name = "SquareNut_main"
+                
+                # 3. 获取当前位置 (Robosuite 刚刚 reset 好的位置，虽然可能是在一条线上)
+                current_pose = self.env.get_obj_pose(target_obj_name) # 4x4 matrix
+                
+                # 4. 生成均匀分布的噪声 (Uniform Noise) -> 这就是产生"云状"分布的关键
+                import numpy as np
+                noise = np.random.uniform(low=-range_limit, high=range_limit, size=3)
+                noise[2] = 0.0  # 锁死 Z 轴 (高度)，只在桌面 XY 平面随机，防止掉到桌子下
+                
+                # 5. 应用新位置
+                new_pose = current_pose.copy()
+                new_pose[:3, 3] += noise  # 在原位置基础上加上噪声
+                
+                # 调用环境接口设置新位置
+                self.env.set_obj_pose(target_obj_name, new_pose)
+                
+                # 6. 【重要】由于物理状态变了，必须刷新观测 (obs)
+                # 确保物理引擎更新
+                if hasattr(self.env.env, "sim"):
+                    self.env.env.sim.forward()
+                elif hasattr(self.env.env, "env") and hasattr(self.env.env.env, "sim"):
+                    self.env.env.env.sim.forward()
+                    
+                obs = self.env.get_observation()
+                
+                # (可选) 打印一下，确认生效
+                # print(f"Object relocated to: {new_pose[:3, 3]}")
+                
+            except Exception as e:
+                print(f"Warning: Manual randomization failed. Reason: {e}")
+        # ==============================================================================
+        # 【新增代码 END】
+        # ==============================================================================
+
         state = self.env.get_state()
         if self.use_reset_near_constraint:
             self.policy.current_constraint_sequence_idx = random.randint(
@@ -3846,7 +3895,7 @@ class DemoGenerator:
             state["states"] = demos[0].states[0]
             self.env.env.reset_to(state)
             obs = self.env.get_observation()
-
+        
         # 【新增修复】：在循环开始前先同步一次约束
         if len(self.policy.current_constraint_sequence) > 0:
             first_constraint = self.policy.current_constraint_sequence[0]
@@ -4045,7 +4094,7 @@ def save_demo(demo: Dict[str, Any], save_path: str, env_meta: str):
                 "privileged_contact_force"
             ]
             first_frame = demo["observations"][0]
-
+            
             for k in keys_to_save:
                 if k in first_frame:
                     # 提取数据并存入
@@ -4248,7 +4297,7 @@ class Config:
     def __post_init__(self):
         if self.motion_plan_save_dir:
             self.motion_plan_save_dir = pathlib.Path(self.motion_plan_save_dir)
-
+        
         if not self.merge_demo_save_path:
             self.merge_demo_save_path = f"datasets/generated/{self.env_name}/merged_demos.hdf5"
 

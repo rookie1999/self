@@ -42,8 +42,8 @@ import numpy as np
 import robosuite
 import torch
 import tyro
-import torch.nn as nn
-import torch.optim as optim
+import torch.nn as nn          
+import torch.optim as optim    
 from collections import deque
 from lxml import etree as ET
 from mink import Configuration
@@ -97,23 +97,35 @@ from demo_aug.utils.xml_utils import (
 
 
 def save_checkpoint(path, guide, curriculum):
-    """保存所有状态，实现断点续传"""
+    """保存所有状态，实现完美断点续传"""
     checkpoint = {
-        # --- 模型部分 ---
+        # --- 1. 模型与优化器 ---
         'model_state': guide.model.state_dict(),
         'optimizer_state': guide.optimizer.state_dict(),
-
-        # --- 数据部分 (关键：不需要重新收集数据) ---
-        'pos_buffer': list(guide.pos_buffer), # 转为 list 以便序列化
+        
+        # --- 2. 经验池 (数据) ---
+        'pos_buffer': list(guide.pos_buffer),
         'neg_buffer': list(guide.neg_buffer),
-
-        # --- 统计量部分 (关键：模型能正确处理输入) ---
+        
+        # --- 3. 归一化统计量 ---
         'input_mean': guide.input_mean,
         'input_std': guide.input_std,
         'n_stats': guide.n_stats,
-
-        # --- 课程进度 ---
-        'generated_count': curriculum.generated_count
+        
+        # --- 4. 课程状态 (关键修复) ---
+        'curriculum_state': {
+            'generated_count': curriculum.generated_count,
+            'epsilon': curriculum.epsilon,
+            'current_range_limit': curriculum.current_range_limit,
+            
+            # [新增] 保存 Warmup 状态
+            'has_kickstarted': curriculum.has_kickstarted,
+            
+            # [新增] 保存自适应刹车状态
+            'success_history': list(curriculum.success_history),
+            'detected_limit': curriculum.detected_limit,
+            'is_range_frozen': curriculum.is_range_frozen,
+        }
     }
     torch.save(checkpoint, path)
 
@@ -121,116 +133,191 @@ def load_checkpoint(path, guide, curriculum, reset_curriculum=False):
     if not os.path.exists(path):
         print(f"⚠️ No checkpoint found at {path}, starting from scratch (Epsilon=1.0).")
         return False
-
+        
     print(f"🔄 Loading checkpoint from {path}...")
     try:
+        # map_location 确保加载到正确的设备 (CPU/GPU)
         checkpoint = torch.load(path, map_location=guide.device, weights_only=False)
-
-        # 1. 恢复模型权重与统计量 (永远需要)
+        
+        # ====================================================
+        # 1. 恢复模型大脑 (Guide) - 必需部分
+        # ====================================================
         guide.model.load_state_dict(checkpoint['model_state'])
         guide.optimizer.load_state_dict(checkpoint['optimizer_state'])
-        guide.pos_buffer = deque(checkpoint['pos_buffer'], maxlen=5000)
-        guide.neg_buffer = deque(checkpoint['neg_buffer'], maxlen=5000)
+        
+        # 恢复数据池
+        guide.pos_buffer = deque(checkpoint['pos_buffer'], maxlen=2000)
+        guide.neg_buffer = deque(checkpoint['neg_buffer'], maxlen=2000)
+        
+        # 恢复统计量 (确保在正确设备上)
         guide.input_mean = checkpoint['input_mean'].to(guide.device)
         guide.input_std = checkpoint['input_std'].to(guide.device)
         guide.n_stats = checkpoint['n_stats']
+        
+        # ====================================================
+        # 2. 恢复课程状态 (Curriculum) - 不兼容旧版，直接读取
+        # ====================================================
+        # 直接获取字典，如果没有这个键，说明存档版本不对，直接抛出 KeyError 是好事
+        curr_state = checkpoint['curriculum_state']
+        curriculum.has_kickstarted = curr_state['has_kickstarted']
+        # 计算当前经验总量，用于决策
+        total_experience = len(guide.pos_buffer) + len(guide.neg_buffer)
 
-        # 获取之前训练过的总步数（如果有记录的话，没有就默认为0）
-        prev_generated_count = checkpoint.get('generated_count', 0)
-
-        # 2. 策略分歧点
+        # --- 分支 A: 重置课程 (利用老模型，开启新征程) ---
         if reset_curriculum:
             print("🔄 [Strategy] Model weights loaded. Resetting difficulty to EASY.")
-
-            # [核心需求实现]
-            # 重置进度，让 range 回到 0.05
+            
+            # 1. 进度归零，从头开始增加难度
             curriculum.generated_count = 0
-
-            # 动态设置起始 Epsilon：
-            total_experience = len(guide.pos_buffer) + len(guide.neg_buffer)
-
-            # 定义衰减逻辑：经验越丰富，起始探索率越低，但最低不低于 0.3
+            
+            # 3. 重置刹车机制
+            curriculum.is_range_frozen = False
+            curriculum.detected_limit = curriculum.max_range
+            curriculum.success_history.clear()
+            
+            # 4. 动态计算起始 Epsilon (老司机的车，起步可以快一点)
             if total_experience < 200:
-                new_start_eps = 1.0  # 全随机
+                new_start_eps = 1.0
             elif total_experience < 500:
-                new_start_eps = 0.7  # 多探索
-            elif total_experience < 1000:
-                new_start_eps = 0.4  # 半信半疑
+                new_start_eps = 0.5
             else:
-                new_start_eps = 0.2  # 少量探索
-
+                new_start_eps = 0.2 # 经验丰富，直接信任模型
+            
             curriculum.start_epsilon = new_start_eps
-            print(f"🔄 [Strategy] Adaptive Start Epsilon: {new_start_eps} (Based on {total_experience} samples)")
+            print(f"🔄 [Strategy] Adaptive Start Epsilon: {new_start_eps} (Buffers: {total_experience})")
+
+        # --- 分支 B: 断点续传 (完美恢复现场) ---
         else:
-            print("🔄 [Strategy] Resuming training from previous progress.")
-            # 恢复进度，接着上次的练
-            curriculum.generated_count = prev_generated_count
-            # 保持原始设定，因为我们要延续之前的衰减曲线
-            curriculum.start_epsilon = 1.0
+            print("🔄 [Strategy] Resuming training fully from previous state.")
+            
+            # 1. 恢复核心进度
+            curriculum.generated_count = curr_state['generated_count']
+            curriculum.start_epsilon = 1.0 # 保持默认，因为 epsilon 是根据 generated_count 算出来的
+            
+            # 2. 恢复所有标志位 (直接读取，不给默认值，强制要求存档完整)
+            curriculum.current_range_limit = curr_state['current_range_limit']
+            
+            # 3. 恢复刹车状态
+            curriculum.is_range_frozen = curr_state['is_range_frozen']
+            curriculum.detected_limit = curr_state['detected_limit']
+            curriculum.success_history = deque(curr_state['success_history'], maxlen=20)
 
+        # ====================================================
         # 3. 刷新状态
+        # ====================================================
         curriculum.update_schedule()
-
+        
         print(f"✅ Checkpoint loaded!")
         print(f"   Buffer: {len(guide.pos_buffer)}P / {len(guide.neg_buffer)}N")
-        print(f"   Current Status: Step {curriculum.generated_count}, "
-              f"Eps {curriculum.epsilon:.2f}, Range {curriculum.current_range_limit:.2f}")
+        print(f"   Status: Step {curriculum.generated_count}, "
+              f"Range {curriculum.current_range_limit:.3f}, "
+              f"Kickstarted: {curriculum.has_kickstarted}")
         return True
+        
+    except KeyError as e:
+        print(f"❌ Checkpoint format mismatch (KeyError): {e}")
+        print("   Your checkpoint might be from an old version. Please delete it and restart.")
+        return False
     except Exception as e:
         print(f"❌ Failed to load checkpoint: {e}")
-        # 如果加载失败，确保回退到初始状态
+        # 如果加载失败，确保回退到初始状态，防止参数污染
         curriculum.start_epsilon = 1.0
         return False
+   
+class ResBlock(nn.Module):
+    """残差块：增强模型拟合复杂边界的能力"""
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.layer = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim), # 加上 LayerNorm 稳定训练
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+        )
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        return self.relu(x + self.layer(x))
+
 
 class PositionFeasibilityGuide:
     def __init__(self, object_dim=3, device='cpu', learning_rate=1e-3):
         self.device = device
         self.object_dim = object_dim
 
-        # 1. 定义模型 (简单的 MLP)
+        # =========================================================
+        # [修改 1] 网络结构升级
+        # 1. 输入维度改为 5 (x, y, z, r, theta)
+        # 2. 保持 ResNet 结构，增加容量
+        # =========================================================
+        hidden_dim = 256
+        
         self.model = nn.Sequential(
-            nn.Linear(object_dim, 128),
+            nn.Linear(5, hidden_dim), # 输入维度 3 -> 5
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
-            nn.Dropout(0.1),  # 防止过拟合
-            nn.Linear(128, 64),
+            
+            # 残差块 (保持不变)
+            ResBlock(hidden_dim),
+            ResBlock(hidden_dim),
+            ResBlock(hidden_dim),
+            
+            nn.Linear(hidden_dim, 128),
             nn.ReLU(),
-            nn.Linear(64, 1),
+            nn.Linear(128, 1),
             nn.Sigmoid()
         ).to(device)
 
         self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
-        self.loss_fn = nn.BCELoss()
+        
+        # [修改 2] 恢复普通 Loss，不再使用 reduction='none' 和手动加权
+        self.loss_fn = nn.BCELoss() 
 
-        # 2. 数据缓冲区
-        self.pos_buffer = deque(maxlen=5000) # 成功样本
-        self.neg_buffer = deque(maxlen=5000) # 失败样本
+        # --- 经验回放缓冲区 ---
+        self.pos_buffer = deque(maxlen=2000)
+        self.neg_buffer = deque(maxlen=2000)
 
-        # 3. 归一化统计量 (Running Statistics)
+        # --- 归一化统计量 ---
         self.register_buffer_stats()
+        
+        # 梯度步长 (备用，虽然现在的 optimize_position 主要靠采样)
+        self.guidance_lr = 0.01
 
-        # 4. [关键] 工作空间限制 (根据你的 NutAssembly 任务估算)
-        # 格式: [[x_min, x_max], [y_min, y_max], [z_min, z_max]]
-        # 假设 NutAssemblySquare 桌面中心大概在 (0,0) 附近
-        self.workspace_limits = torch.tensor([
-            [-0.30, 0.30],  # X 轴范围
-            [-0.30, 0.30],  # Y 轴范围
-            [ 0.80, 1.00]   # Z 轴范围 (桌面高度通常是 0.8~0.9)
-        ]).to(device)
-
-        self.guidance_lr = 0.005  # 修正位置时的步长
+    # [新增] 特征增强函数：计算极坐标
+    def _augment_input(self, xyz_tensor):
+        """
+        输入: (Batch, 3) -> [x, y, z]
+        输出: (Batch, 5) -> [x, y, z, r, theta]
+        """
+        # 假设输入已经是归一化后的数据，这对于相对特征提取是可以的
+        x = xyz_tensor[:, 0]
+        y = xyz_tensor[:, 1]
+        
+        # 计算半径 r 和角度 theta
+        # 加上 1e-6 防止原点处梯度爆炸
+        r = torch.sqrt(x**2 + y**2 + 1e-6)
+        theta = torch.atan2(y, x)
+        
+        # 拼接特征
+        # unsqueeze(1) 将 (Batch,) 变为 (Batch, 1) 以便拼接
+        return torch.cat([xyz_tensor, r.unsqueeze(1), theta.unsqueeze(1)], dim=1)
 
     def register_buffer_stats(self):
-        """初始化归一化参数"""
         self.input_mean = torch.zeros(self.object_dim).to(self.device)
         self.input_std = torch.ones(self.object_dim).to(self.device)
         self.n_stats = 0
 
     def update_stats(self, new_data):
-        """简单的在线均值方差更新"""
-        batch_mean = torch.mean(new_data, dim=0)
-        batch_std = torch.std(new_data, dim=0) + 1e-6
+        if new_data.shape[0] < 2:
+            alpha = 0.01
+            batch_mean = torch.mean(new_data, dim=0)
+            self.input_mean = (1 - alpha) * self.input_mean + alpha * batch_mean
+            return
 
-        # 简单的移动平均更新 (Momentum update)
+        batch_mean = torch.mean(new_data, dim=0)
+        batch_std = torch.std(new_data, dim=0) 
+
         alpha = 0.1
         if self.n_stats == 0:
             self.input_mean = batch_mean
@@ -241,179 +328,142 @@ class PositionFeasibilityGuide:
         self.n_stats += 1
 
     def normalize(self, x):
-        return (x - self.input_mean) / (self.input_std + 1e-8)
+        if torch.isnan(self.input_std).any():
+            self.input_std = torch.ones_like(self.input_std)
+        safe_std = torch.clamp(self.input_std, min=1e-6)
+        return (x - self.input_mean) / safe_std
 
-    def update_model(self, pos, is_success):
-        """
-        收集数据并基于经验回放池进行多步训练
-        """
-        # 1. 存入 Buffer
+    def train_step(self, batch_size=64):
+        # 1. 检查样本
+        if len(self.pos_buffer) < 2 or len(self.neg_buffer) < 2:
+            return None
+
+        # 2. 采样 (保持 1:1 平衡采样，不再需要手动调整 n_neg)
+        n_pos = batch_size // 2
+        n_neg = batch_size - n_pos
+        
+        if len(self.pos_buffer) < n_pos:
+            n_pos = len(self.pos_buffer)
+            n_neg = batch_size - n_pos
+        elif len(self.neg_buffer) < n_neg:
+            n_neg = len(self.neg_buffer)
+            n_pos = batch_size - n_neg
+            
+        pos_samples = random.sample(self.pos_buffer, n_pos)
+        neg_samples = random.sample(self.neg_buffer, n_neg)
+
+        # 3. 数据转换
+        data_np = np.array(pos_samples + neg_samples, dtype=np.float32)
+        labels_np = np.array([1]*n_pos + [0]*n_neg, dtype=np.float32).reshape(-1, 1)
+
+        data = torch.tensor(data_np).to(self.device)
+        labels = torch.tensor(labels_np).to(self.device)
+
+        # 4. 前向传播 (含特征增强)
+        norm_data = self.normalize(data)
+        
+        # [关键修改] 在送入模型前，先做特征增强 (3维 -> 5维)
+        aug_data = self._augment_input(norm_data)
+        
+        preds = self.model(aug_data) # 现在模型接受 5 维输入
+        
+        # [修改 3] 使用普通的 Loss，移除之前的手动加权逻辑
+        loss = self.loss_fn(preds, labels)
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        
+        return loss.item()
+
+    def update_model(self, pos, is_success, enable_training=False):
+        # 逻辑保持不变，直接复用你现有的
         target_buffer = self.pos_buffer if is_success else self.neg_buffer
         target_buffer.append(pos)
+        
+        try:
+            tensor_pos = torch.from_numpy(np.array([pos], dtype=np.float32)).to(self.device)
+            self.update_stats(tensor_pos)
+        except Exception:
+            pass
 
-        # -----------------------------------------------------
-        # [配置] 训练参数
-        # -----------------------------------------------------
-        batch_size = 64
-        # -----------------------------------------------------
-        # [配置] 训练参数
-        # -----------------------------------------------------
-        batch_size = 64
-
-        # =========== [关键修改] 动态计算训练步数 ===========
-        total_samples = len(self.pos_buffer) + len(self.neg_buffer)
-
-        # 目标：每次更新至少把所有数据过一遍 (1 Epoch)
-        # 计算需要多少个 Batch 才能覆盖所有数据
-        needed_steps_for_one_epoch = total_samples // batch_size
-        # 设定策略：
-        # 1. 下限 5 步：保证初期多练练
-        # 2. 上限 50 步：防止后期数据太多导致卡顿 (50 * 64 = 3200 样本，足够了)
-        # 3. 中间取值：尽可能跑完一个 Epoch
-        train_steps = max(5, min(needed_steps_for_one_epoch, 50))
-        # =================================================
-
-        # -----------------------------------------------------
-        # [检查] 是否满足最小训练条件
-        # -----------------------------------------------------
-        # 1. 总样本数必须能填满一个 Batch，否则 Batch Normalization (如果有) 会不稳，且梯度噪声大
-        if (len(self.pos_buffer) + len(self.neg_buffer)) < batch_size:
+        if not enable_training:
             return
 
-        # 2. 正负样本每一类至少要有 2 个，否则无法形成分类边界 (全 0 或 全 1 的 Label 会导致模型坍塌)
-        if len(self.pos_buffer) < 2 or len(self.neg_buffer) < 2:
+        batch_size = 64
+        total_samples = len(self.pos_buffer) + len(self.neg_buffer)
+        if total_samples < batch_size:
+            return
+
+        needed_steps = total_samples // batch_size
+        train_steps = max(5, min(needed_steps, 50))
+
+        self.model.train()
+        for _ in range(train_steps):
+            try:
+                self.train_step(batch_size)
+            except Exception as e:
+                print(f"⚠️ [Guide] Training step failed: {e}")
+                break
+
+    def train_explicitly(self, steps=500, batch_size=64):
+        # 逻辑保持不变
+        if len(self.pos_buffer) < 5 or len(self.neg_buffer) < 5:
+            print("⚠️ Not enough data to kickstart training.")
             return
 
         self.model.train()
-        final_loss = 0.0
-
-        # -----------------------------------------------------
-        # [循环] 多步梯度更新 (Online Learning w/ Replay)
-        # -----------------------------------------------------
-        for step_i in range(train_steps):
-
-            # --- A. 动态互补采样逻辑 (核心修复) ---
-            # 目标：尽量各占一半 (16 vs 16)
-            n_pos = batch_size // 2
-            n_neg = batch_size - n_pos
-
-            n_pos_total = len(self.pos_buffer)
-            n_neg_total = len(self.neg_buffer)
-
-            # 如果某一方样本不够，就取它的全部，另一方多取点补齐
-            if n_pos_total < n_pos:
-                n_pos = n_pos_total
-                n_neg = batch_size - n_pos # 此时必然满足 n_neg <= n_neg_total (因为总数 > batch_size)
-            elif n_neg_total < n_neg:
-                n_neg = n_neg_total
-                n_pos = batch_size - n_neg
-
-            # 执行采样
-            pos_samples = random.sample(self.pos_buffer, n_pos)
-            neg_samples = random.sample(self.neg_buffer, n_neg)
-
-            # --- B. 数据转换 ---
-            data_np = np.array(pos_samples + neg_samples, dtype=np.float32)
-            labels_np = np.array([1]*n_pos + [0]*n_neg, dtype=np.float32).reshape(-1, 1)
-
-            data = torch.tensor(data_np).to(self.device)
-            labels = torch.tensor(labels_np).to(self.device)
-
-            # --- C. 更新归一化统计量 ---
-            # 建议：只在每轮训练的第一步更新统计量，防止单次更新中统计量抖动过大
-            if step_i == 0:
-                self.update_stats(data)
-
-            # --- D. 前向与反向传播 ---
-            # 注意：这里使用归一化后的数据输入模型
-            norm_data = self.normalize(data)
-            preds = self.model(norm_data)
-            loss = self.loss_fn(preds, labels)
-
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
-
-            final_loss = loss.item()
-
-        # -----------------------------------------------------
-        # [日志] 抽样打印训练状态
-        # -----------------------------------------------------
-        if np.random.random() < 0.2:
-            print(f"   📉 [TRAIN] Steps: {train_steps} | Loss: {final_loss:.4f} | "
-                  f"Batch: {n_pos}P+{n_neg}N | Pool: {len(self.pos_buffer)}P/{len(self.neg_buffer)}N")
+        losses = []
+        print(f"💪 [Guide] Explicit training for {steps} steps...")
+        
+        for i in range(steps):
+            loss = self.train_step(batch_size)
+            if loss is not None:
+                losses.append(loss)
+        
+        avg_loss = sum(losses) / len(losses) if losses else 0.0
+        print(f"✅ [Guide] Training complete. Avg Loss: {avg_loss:.4f}")
 
     def optimize_position(self, initial_pos):
         """
-        输入初始位置，利用梯度上升寻找使得成功率更高的新位置
-        集成：梯度截断、强距离惩罚、失败回退 (移除了边界约束)
+        采样优选策略 (Sampling & Ranking) - 适配新的特征输入
         """
         self.model.eval()
-
         original_z = initial_pos[2]
 
-        # 1. 准备数据
-        # start_tensor 用于计算距离惩罚，作为“锚点”
+        search_radius = 0.05 
+        num_candidates = 128
+
+        # 生成候选点
+        noise = torch.randn(num_candidates, 3, device=self.device) * search_radius
+        noise[:, 2] = 0.0
         start_tensor = torch.tensor(initial_pos, dtype=torch.float32, device=self.device)
-        obj_tensor = start_tensor.clone().requires_grad_(True)
+        candidates = start_tensor + noise
+        candidates[0] = start_tensor # 包含原点
 
-        start_pos_str = f"({initial_pos[0]:.2f}, {initial_pos[1]:.2f})"
-        initial_prob = 0.5
+        # 批量打分
+        with torch.no_grad():
+            norm_inputs = self.normalize(candidates)
+            
+            # [关键修改] 这里也要特征增强
+            aug_inputs = self._augment_input(norm_inputs)
+            
+            probs = self.model(aug_inputs).squeeze()
 
-        # 迭代优化
-        for i in range(10):
-            norm_input = self.normalize(obj_tensor)
-            prob = self.model(norm_input)
+        # 挑选冠军
+        best_idx = torch.argmax(probs)
+        best_prob = probs[best_idx].item()
+        best_pos = candidates[best_idx].cpu().numpy()
+        best_pos[2] = original_z
 
-            if i == 0:
-                initial_prob = prob.item()
+        initial_prob = probs[0].item()
 
-            target = torch.tensor([1.0], device=self.device)
-            base_loss = self.loss_fn(prob, target)
-
-            # =========== [Point 2 部分 A] 强距离惩罚 ===========
-            # 既然没有边界墙，这根“绳子”就要拉紧一点
-            # 系数设为 20.0，只要偏离初始点，Loss 就会迅速上升
-            dist_sq = torch.sum((obj_tensor - start_tensor)**2)
-
-            # [修改] 移除了 bound_loss
-            loss = base_loss + 20.0 * dist_sq
-            # =================================================
-
-            self.model.zero_grad()
-            loss.backward()
-
-            # =========== [Point 2 部分 B] 梯度截断 ===========
-            grad = obj_tensor.grad.data
-            grad[2] = 0.0 # 锁 Z 轴
-
-            # 关键：限制单步梯度的最大值，防止“飞出天际”
-            # 将梯度限制在 [-1.0, 1.0] 范围内
-            grad = torch.clamp(grad, -1.0, 1.0)
-
-            obj_tensor.data -= self.guidance_lr * grad
-
-            # [修改] 移除了 obj_tensor.data 的 clamp 操作 (因为没有 workspace_limits 了)
-
-            obj_tensor.grad.zero_()
-
-        # --- 最终结果计算 ---
-        final_prob = self.model(self.normalize(obj_tensor)).item()
-        final_pos = obj_tensor.detach().cpu().numpy()
-        final_pos[2] = original_z
-
-        end_pos_str = f"({final_pos[0]:.2f}, {final_pos[1]:.2f})"
-
-        # =========== [Point 3] 置信度回退机制 ===========
-        # 如果优化后的概率比初始概率还低（或者绝对值太低），说明优化失败，回滚。
-        if final_prob < (initial_prob - 0.05) or final_prob < 0.2:
-            print(f"      ⚠️ [REJECT] Optimization degraded ({initial_prob:.2f}->{final_prob:.2f}). Reverting to random.")
+        # [决策逻辑] 放宽了阈值，因为我们移除了负样本加权，模型分数会更正常
+        # 只要比原来好，或者分数本身很高 (>0.8)，就采纳
+        if best_prob > initial_prob or best_prob > 0.6:
+            return best_pos
+        else:
             return initial_pos
-        # ==============================================
-
-        print(f"      ✨ [OPTIMIZE] Pos: {start_pos_str} -> {end_pos_str} | Success Prob: {initial_prob:.2f} -> {final_prob:.2f}")
-
-        return final_pos
 
 # class CurriculumManager:
 #     def __init__(self, guide, total_target_demos=100, start_epsilon=1.0):
@@ -426,27 +476,27 @@ class PositionFeasibilityGuide:
 #         self.guide = guide
 #         self.total_target_demos = total_target_demos
 #         self.generated_count = 0
-
+        
 #         # =========== [修复] 初始化 start_epsilon ===========
-#         self.start_epsilon = start_epsilon
+#         self.start_epsilon = start_epsilon 
 #         self.epsilon = start_epsilon
 #         # =================================================
-
+        
 #         self.epsilon_min = 0.2
-
+        
 #         # 范围控制：为了提高成功率，建议把 max_range 稍微改小一点 (0.12)
 #         self.current_range_limit = 0.02
 #         self.min_range = 0.02
-#         self.max_range = 0.12
-
-#         self.warmup_samples_threshold = 200
+#         self.max_range = 0.12  
+        
+#         self.warmup_samples_threshold = 200 
 
 #     def get_next_position(self, rough_pos):
 #         # 1. 获取当前数据总量
 #         total_samples = len(self.guide.pos_buffer) + len(self.guide.neg_buffer)
-
-#         status_prefix = f"[Curriculum {self.generated_count}/{self.total_target_demos}]"
-
+        
+#         status_prefix = f"[Curriculum {self.generated_count}/{self.total_target_demos}]" 
+        
 #         # Warmup
 #         if total_samples < self.warmup_samples_threshold:
 #             print(f"{status_prefix} 🟢 [WARMUP] 样本不足 ({total_samples}/{self.warmup_samples_threshold}). 使用随机生成。")
@@ -468,7 +518,7 @@ class PositionFeasibilityGuide:
 #     def update_schedule(self):
 #         """根据当前进度更新策略"""
 #         progress = min(1.0, self.generated_count / self.total_target_demos)
-
+        
 #         # 使用 start_epsilon 进行计算
 #         self.epsilon = self.start_epsilon - (self.start_epsilon - self.epsilon_min) * progress
 #         self.current_range_limit = self.min_range + (self.max_range - self.min_range) * progress
@@ -486,92 +536,127 @@ class CurriculumManager:
         # --- 探索策略参数 ---
         self.start_epsilon = start_epsilon
         self.epsilon = start_epsilon
-        self.epsilon_min = 0.2
+        
+        # [修改] 最低探索率保持在 0.05，给模型充分信任
+        self.epsilon_min = 0.05 
 
         # --- 难度控制参数 (Range) ---
         self.current_range_limit = 0.02
-        self.min_range = 0.02
-        # 设大一点，让自适应机制去探底
-        self.max_range = 0.20
+        self.min_range = 0.05
+        # [修改] 既然有了拒绝采样，Range 可以大胆设大一点
+        self.max_range = 0.30 
 
-        self.warmup_samples_threshold = 200
+        # --- Warmup 相关 ---
+        self.warmup_samples_threshold = 400
+        self.has_kickstarted = False 
 
-        # --- 自适应监控与刹车机制 ---
+        # --- 自适应刹车监控 ---
         self.success_history = deque(maxlen=20)
         self.detected_limit = self.max_range
         self.is_range_frozen = False
 
     def _fmt(self, pos):
-        """辅助函数：将 numpy 数组格式化为易读的字符串 (x, y, z)"""
-        return f"({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f})"
+        return f"({pos[0]:.3f}, {pos[1]:.3f})"
 
     def get_next_position(self, rough_pos):
         """
-        根据当前 Range 生成扰动位置，并决定是随机探索还是利用模型优化位置
+        [策略升级] 边缘拓展策略 (Frontier Exploration)
+        先找安全锚点，再向边缘试探。
         """
-        # 1. 获取当前数据总量
         total_samples = len(self.guide.pos_buffer) + len(self.guide.neg_buffer)
         status_prefix = f"[Curriculum {self.generated_count}/{self.total_target_demos}]"
 
-        # ================== [核心修复] 主动注入噪声 ==================
-        noise = np.random.uniform(
-            low  = -self.current_range_limit,
-            high =  self.current_range_limit,
-            size = 3
-        )
-        # 锁定 Z 轴噪声 (可选)
-        noise[2] = 0.0
+        # 1. 决定是否使用模型
+        use_model = False
+        if total_samples >= self.warmup_samples_threshold and random.random() >= self.epsilon:
+            use_model = True
 
-        # 生成真正的“挑战位”
-        noisy_pos = rough_pos + noise
-        # ==========================================================
-
-        # 2. Warmup 阶段
-        if total_samples < self.warmup_samples_threshold:
-            # [修改] 打印 noisy_pos
-            print(f"{status_prefix} 🟢 [WARMUP] 样本不足. Range={self.current_range_limit:.2f} | Pos: {self._fmt(noisy_pos)}")
+        # 如果还在 Warmup 或 Epsilon 随机阶段，直接返回随机点
+        if not use_model:
+            noise = np.random.uniform(-self.current_range_limit, self.current_range_limit, size=3)
+            noise[2] = 0.0
+            noisy_pos = rough_pos + noise
+            
+            tag = "WARMUP" if total_samples < self.warmup_samples_threshold else "EXPLORE"
+            print(f"{status_prefix} 🎲 [{tag}] Eps={self.epsilon:.2f} | Pos: {self._fmt(noisy_pos)}")
             return noisy_pos, self.current_range_limit
 
-        # 3. Epsilon-Greedy 策略
-        if random.random() < self.epsilon:
-            # [修改] 打印 noisy_pos
-            print(f"{status_prefix} 🎲 [EXPLORE] Epsilon探索 (eps={self.epsilon:.2f}) | Pos: {self._fmt(noisy_pos)}")
-            return noisy_pos, self.current_range_limit
-        else:
-            # [修改] 打印 noisy_pos 作为 "Input"
-            print(f"{status_prefix} 🤖 [EXPLOIT] 模型接管 (Range={self.current_range_limit:.2f}) | Input: {self._fmt(noisy_pos)}")
+        # =====================================================
+        # 2. 模型接管：寻找高置信度锚点 (Anchor Search)
+        # =====================================================
+        anchor_point = None
+        max_search_attempts = 50
+        
+        for _ in range(max_search_attempts):
+            # 在当前 Range 内随机撒点
+            cand_noise = np.random.uniform(-self.current_range_limit, self.current_range_limit, size=3)
+            cand_noise[2] = 0.0
+            candidate = rough_pos + cand_noise
+            
+            # 打分
+            with torch.no_grad():
+                t_cand = torch.tensor(candidate, dtype=torch.float32, device=self.guide.device).unsqueeze(0)
+                # 注意：必须调用我们在 Guide 里新写的 _augment_input
+                # 先归一化
+                norm_cand = self.guide.normalize(t_cand)
+                # 再特征增强 (3维 -> 5维)
+                aug_cand = self.guide._augment_input(norm_cand)
+                score = self.guide.model(aug_cand).item()
+            
+            # [关键阈值] 只有分数 > 0.6 才算作稳固的锚点
+            # 因为我们要基于它向外推，如果地基不稳，推出去必死
+            if score > 0.6:
+                anchor_point = candidate
+                break
+        
+        # 情况 A: 找不到安全锚点 (说明当前 Range 太难，或者模型太悲观)
+        if anchor_point is None:
+            # 退化策略：随机生成一个，然后尝试修一下
+            print(f"{status_prefix} ⚠️ [NoAnchor] Safe zone not found. Falling back to Optimization.")
+            fallback_pos = rough_pos + np.random.uniform(-self.current_range_limit, self.current_range_limit, size=3)
+            fallback_pos[2] = 0.0
             try:
-                # 让 AI 尝试修复这个“烂位置”
-                optimized_pos = self.guide.optimize_position(noisy_pos)
+                opt_pos = self.guide.optimize_position(fallback_pos)
+                return opt_pos, self.current_range_limit
+            except:
+                return fallback_pos, self.current_range_limit
 
-                # 注意：self.guide.optimize_position 内部通常已经会打印 "Start -> End" 的日志
-                # 所以这里不需要再打印 optimized_pos，否则日志会重复
-
-                return optimized_pos, self.current_range_limit
-            except Exception as e:
-                print(f"[Curriculum] AI Optimization failed, using random: {e}")
-                return noisy_pos, self.current_range_limit
+        # 情况 B: 找到了锚点 -> 执行边缘拓展 (Frontier Expansion)
+        # 在安全点附近，加一个微小的“探索噪声”
+        frontier_noise = np.random.uniform(-0.04, 0.04, size=3) # +/- 4cm
+        frontier_noise[2] = 0.0
+        
+        final_pos = anchor_point + frontier_noise
+        
+        # 打印日志
+        print(f"{status_prefix} 🚀 [FRONTIER] Anchor={score:.2f} | Input: {self._fmt(final_pos)}")
+        
+        return final_pos, self.current_range_limit
 
     def update_schedule(self):
-        """核心调度逻辑：更新 Epsilon 和 Range，执行自适应刹车"""
+        """核心调度逻辑：延迟衰减 Epsilon"""
         progress = min(1.0, self.generated_count / self.total_target_demos)
 
-        # 更新 Epsilon
-        self.epsilon = self.start_epsilon - (self.start_epsilon - self.epsilon_min) * progress
+        # Epsilon 策略：前 20% 保持高位，给模型学习时间
+        warmup_period_ratio = 0.2
+        if progress < warmup_period_ratio:
+            self.epsilon = self.start_epsilon
+        else:
+            adjusted_prog = (progress - warmup_period_ratio) / (1.0 - warmup_period_ratio)
+            self.epsilon = self.start_epsilon - (self.start_epsilon - self.epsilon_min) * adjusted_prog
+        
+        self.epsilon = max(self.epsilon_min, self.epsilon)
 
-        # 新版：对数增长 / 根号增长 (前期涨得快，后期慢)
-        # 比如用 sqrt(progress)，在 progress=0.25 (第50步) 时就能达到 50% 的 Range
-        curve_factor = progress ** 0.5
+        # Range 策略：根号增长
+        curve_factor = progress ** 0.4 
         planned_range = self.min_range + (self.max_range - self.min_range) * curve_factor
 
-        # 自适应刹车逻辑
+        # 刹车逻辑
         if not self.is_range_frozen:
             if len(self.success_history) == self.success_history.maxlen and planned_range > 0.05:
                 recent_success_rate = sum(self.success_history) / len(self.success_history)
-                # 如果最近 20 次成功率低于 30%，锁死 Range
                 if recent_success_rate < 0.30:
-                    print(f"🛑 [AUTO-STOP] Difficulty Limit Detected! Success rate dropped to {recent_success_rate:.2f}.")
-                    print(f"    Locking max range at {planned_range:.3f}")
+                    print(f"🛑 [AUTO-STOP] Success rate {recent_success_rate:.2f}. Locking Range.")
                     self.detected_limit = planned_range
                     self.is_range_frozen = True
 
@@ -812,17 +897,17 @@ class CPEnv:
             try:
                 # 获取当前关注的目标物体名称
                 target_name = self.current_constraint.obj_names[0]
-
+                
                 # [几何信息] 获取目标物体的绝对坐标
                 # 注意：这里直接取物理中心，不做人为偏移，保持数据的通用性
                 target_pos = self.env.env.sim.data.get_body_xpos(target_name).copy()
-
+                
                 # [几何信息] 计算 3D 相对矢量 (Target - EEF)
                 rel_vec = (target_pos - eef_pos).astype(np.float32)
 
                 # [接触信息] 准备工作：获取目标物体的 Body ID
                 target_body_id = self.env.env.sim.model.body_name2id(target_name)
-
+                
                 # [接触信息] 准备工作：筛选出机器人夹爪/手部的所有几何体 ID
                 robot_geom_ids = set()
                 # 遍历所有几何体，增加非空判断以修复 "NoneType" 报错
@@ -830,31 +915,31 @@ class CPEnv:
                     if geom_name and ("finger" in geom_name or "hand" in geom_name):
                         geom_id = self.env.env.sim.model.geom_name2id(geom_name)
                         robot_geom_ids.add(geom_id)
-
+                
                 # [接触信息] 遍历仿真器当前的接触点列表
                 for i in range(self.env.env.sim.data.ncon):
                     contact = self.env.env.sim.data.contact[i]
                     g1, g2 = contact.geom1, contact.geom2
-
+                    
                     # 检查碰撞双方的归属
                     g1_is_robot = g1 in robot_geom_ids
                     g2_is_robot = g2 in robot_geom_ids
-
+                    
                     # 获取接触几何体所属的 Body ID
                     g1_body = self.env.env.sim.model.geom_bodyid[g1]
                     g2_body = self.env.env.sim.model.geom_bodyid[g2]
-
+                    
                     # 判断逻辑：一方是机器人，另一方是目标物体
                     is_relevant_contact = False
                     if g1_is_robot and g2_body == target_body_id:
                         is_relevant_contact = True
                     elif g2_is_robot and g1_body == target_body_id:
                         is_relevant_contact = True
-
+                        
                     if is_relevant_contact:
                         is_contacting = True
                         break # 只要发现哪怕一个接触点，就视为已接触
-
+                
                 # [接触信息] 如果发生接触，读取目标受到的外力合力
                 if is_contacting:
                     # cfrc_ext 包含了该 Body 受到的外部 6D 力 (Fx, Fy, Fz, Tx, Ty, Tz)
@@ -870,12 +955,12 @@ class CPEnv:
         # 注意：这里只存数值类型 (float32)，坚决不存字符串，避免 HDF5 保存报错
         obs["privileged_target_pos"] = target_pos.astype(np.float32)
         obs["privileged_target_rel_pos"] = rel_vec.astype(np.float32)
-
+        
         # 存入接触状态 (1.0 或 0.0)
         obs["privileged_is_contact"] = np.array([1.0 if is_contacting else 0.0], dtype=np.float32)
         # 存入接触力大小 (连续值)
         obs["privileged_contact_force"] = np.array([contact_force], dtype=np.float32)
-
+        
         for obj_name in self.possible_task_relevant_obj_names:
             obs[obj_name + "_pose"] = self.get_obj_pose(obj_name)
             obs[obj_name + "_geoms_size"] = self.get_obj_geoms_size(obj_name)
@@ -4286,83 +4371,99 @@ class DemoGenerator:
         store_single_stage_max_extra_steps: int = 0,
         system_noise_cfg: SystemNoiseConfig = field(default_factory=SystemNoiseConfig)
     ) -> Dict[str, Any]:
+
+        # ==============================================================================
+        # 【新增逻辑 1】: Kickstart Cold-Start Training (Warmup 后的集中训练)
+        # ==============================================================================
+        if self.curriculum_manager is not None:
+            # 检查当前样本总数
+            total_samples = len(self.curriculum_manager.guide.pos_buffer) + \
+                            len(self.curriculum_manager.guide.neg_buffer)
+            
+            # 触发条件：样本数达到阈值，且尚未进行过 Kickstart
+            if total_samples >= self.curriculum_manager.warmup_samples_threshold and \
+               not self.curriculum_manager.has_kickstarted:
+                
+                print(f"\n⚡ [KICKSTART] Warmup complete ({total_samples} samples). Pausing generation to train model...")
+                
+                # 调用我们在 Guide 类里新加的显式训练函数
+                # 训练 500 步 (Batch Size 64)，这足以让模型在初期收敛
+                # 注意：请确保你的 PositionFeasibilityGuide 类已经添加了 train_explicitly 方法
+                self.curriculum_manager.guide.train_explicitly(steps=500, batch_size=64)
+                
+                self.curriculum_manager.has_kickstarted = True
+                print("⚡ [KICKSTART] Training Done. AI Model is now taking over!\n")
+        # ==============================================================================
+
         obss, actions, dones, rewards, infos, states = [], [], [], [], [], []
         constraint_sequence: List[Constraint] = []
         timestep = 0
-
+        
         # 1. 物理环境重置
         obs = self.env.reset()
 
-        # =========== [新增逻辑开始] 位置修正 ===========
-        train_initial_pos = None  # 用于后续训练的数据
+        # ==============================================================================
+        # 【新增逻辑 2】: 位置修正与随机化 (Breaking the Line Distribution)
+        # ==============================================================================
+        train_initial_pos = None  # 用于记录这一轮生成的起始位置，供后续训练用
 
         # 仅在非 Reset-Near 模式且有课程管理器时启用
         if self.curriculum_manager is not None and not self.use_reset_near_constraint and not self.use_reset_to_state:
-            # 假设我们要操作的目标物体是 'SquareNut_main' (或者是从 self.env 获取的关键物体)
-            # 你可能需要根据具体任务修改这个名字，或者从 policy.current_constraint 获取
+            # 目标物体名称 (请根据实际环境确认，NutAssemblySquare 通常是 "SquareNut_main")
             target_obj_name = "SquareNut_main"
 
             try:
-                # 1. 获取环境随机生成的初始位置
+                # A. 获取环境默认生成的初始位置 (Raw Position)
                 current_pose = self.env.get_obj_pose(target_obj_name)
                 raw_pos = current_pose[:3, 3].copy()
 
-                # 2. 调用课程管理器获取新位置 (Random 或 AI 修正)
+                # B. 获取新位置 (包含均匀噪声注入 + AI 潜在的修正)
+                # 这里会打印日志：[WARMUP] / [EXPLORE] / [EXPLOIT]
                 new_pos, _ = self.curriculum_manager.get_next_position(raw_pos)
 
-                # 3. 将新位置应用回环境
-                new_pose = current_pose.copy()
-                new_pose[:3, 3] = new_pos
-                self.env.set_obj_pose(target_obj_name, new_pose)
+                # C. 强制覆盖环境中的物体位置
+                new_pose_mat = current_pose.copy()
+                new_pose_mat[:3, 3] = new_pos
+                self.env.set_obj_pose(target_obj_name, new_pose_mat)
 
-                # ============ [修正] 安全检查 ============
-                # 强制让物理引擎更新一下，检查是否发生了严重碰撞
+                # --- 安全检查 (防止生成到桌子里面或者和机器人重叠) ---
                 try:
-                    # 1. 获取最底层的 sim 对象 (解决 'EnvRobosuite' object has no attribute 'sim' 报错)
-                    # 层级: CPEnv -> EnvRobosuite -> RobosuiteEnv -> sim
+                    # 获取底层 sim 对象进行物理查询
                     if hasattr(self.env.env, "sim"):
                         sim = self.env.env.sim
                     elif hasattr(self.env.env, "env") and hasattr(self.env.env.env, "sim"):
                         sim = self.env.env.env.sim
                     else:
-                        # 兜底：如果找不到 sim，就跳过检查，防止报错
-                        raise AttributeError("Could not find .sim in env wrappers")
+                        sim = None
 
-                    # 2. 前向推进一步检测碰撞
-                    sim.forward()
-
-                    # 3. 使用 CPEnv 的静态方法检查碰撞
-                    # 注意：这里的 model 和 data 也要从 sim 里取
-                    if CPEnv.is_collision(sim.model._model, sim.data._data):
-                        # print(f"⚠️ [Safety] Generated position caused collision. Resetting to default.")
-                        # 如果碰撞了，为了不让程序崩掉，我们把物体放回原处
-                        self.env.set_obj_pose(target_obj_name, current_pose)
-                        new_pos = raw_pos # 记录回去的是原始位置
-
+                    if sim:
+                        sim.forward() # 必须 forward 才能更新碰撞检测
+                        if CPEnv.is_collision(sim.model._model, sim.data._data):
+                            # 如果发生碰撞，回退到原始位置，防止程序崩溃
+                            # print(f"⚠️ [Safety] Generated position caused collision. Reverting.")
+                            self.env.set_obj_pose(target_obj_name, current_pose)
+                            new_pos = raw_pos # 标记为原始位置，因为物理上回退了
+                            sim.forward()
                 except Exception as e:
-                    # 这里的 print 可以保留，用于调试，现在应该不会再报 AttributeError 了
-                    # print(f"Collision check warning: {e}")
-                    pass
-                # ========================================
-
-                # 4. 必须重新获取 obs 和 state，因为物体位置变了！
+                    pass # 忽略非常规环境结构的报错
+                
+                # D. 【关键】刷新观测 (确保 obs 里的特权信息是新位置)
                 obs = self.env.get_observation()
 
-                # 记录用于训练
+                # 记录用于后续的数据闭环训练
                 train_initial_pos = new_pos
 
             except Exception as e:
                 logging.warning(f"Failed to apply curriculum position: {e}")
-        # =========== [新增逻辑结束] ===========
 
         state = self.env.get_state()
-
+        
         # 2. 根据配置决定具体的重置策略 (reset_near_constraint 或 reset_to_state)
         if self.use_reset_near_constraint:
             self.policy.current_constraint_sequence_idx = random.randint(
                 0, len(self.policy.constraint_sequences) - 1
             )
-
+            
             if self.constraint_selection_method == "random":
                 self.policy.current_constraint_idx = random.randint(
                     0, len(self.policy.current_constraint_sequence) - 1
@@ -4399,13 +4500,13 @@ class DemoGenerator:
                 randomize_gripper=True,
             )
             state["states"] = self.env.get_state()["states"]
-
+            
         elif self.use_reset_to_state:
             demos = load_demos(self.reset_state_demo_path, self.reset_state_demo_idx)
             state["states"] = demos[0].states[0]
             self.env.env.reset_to(state)
             obs = self.env.get_observation()
-
+        
         # =========================================================================
         # [修改点 1]：初始同步
         # 在进入循环前，强制将当前的初始 Constraint 同步给环境，并刷新 Obs
@@ -4428,12 +4529,12 @@ class DemoGenerator:
         success = False
         timestep = 0
         failure_type = None
-
+        
         # 3. 开始 Rollout 循环
         while True:
             action_dct = self.policy.get_action(obs)
             action = action_dct["action"]
-
+            
             if action is None:
                 failure_type = action_dct["failure_type"]
                 if failure_type is not None:  # failured
@@ -4456,7 +4557,7 @@ class DemoGenerator:
                     model = update_fixed_joint_objects_in_xml(
                         self.env.env.env.sim.model, model
                     )
-
+                
                 # 构建记录用的 Constraint 对象
                 curr_constraint = Constraint(
                     obj_names=self.policy.current_constraint.obj_names,
@@ -4492,7 +4593,7 @@ class DemoGenerator:
                 self.policy.current_constraint_idx
                 == len(self.policy.current_constraint_sequence) - 1
             )
-
+            
             # 添加噪声 (System Noise)
             if in_constraint_segment and not is_last_constraint_segment:
                 action_to_take += np.random.uniform(-1, 1, action.shape) * np.array(
@@ -4543,7 +4644,7 @@ class DemoGenerator:
                     save_images(
                         obs_lst, "datasets/generated/images-new-full/", save_as_mp4=True
                     )
-
+        
         self.policy.reset()
 
         if len(actions) == 0:
@@ -4557,10 +4658,10 @@ class DemoGenerator:
         # =========== [新增逻辑开始] 数据闭环训练 ===========
         if self.curriculum_manager is not None and train_initial_pos is not None:
             # 告诉 AI：这个起始位置最终是成功了还是失败了
-            self.curriculum_manager.guide.update_model(train_initial_pos, success)
+            self.curriculum_manager.guide.update_model(train_initial_pos, success, enable_training=self.curriculum_manager.has_kickstarted)
             # 增加计数，推进课程难度
             self.curriculum_manager.increment_count()
-
+            
             if self.policy.verbose:
                 print(f"[Curriculum] Updated model. Success: {success}, Count: {self.curriculum_manager.generated_count}")
         # =========== [新增逻辑结束] ===========
@@ -4627,7 +4728,7 @@ def save_demo(demo: Dict[str, Any], save_path: str, env_meta: str):
                 "privileged_contact_force"
             ]
             first_frame = demo["observations"][0]
-
+            
             for k in keys_to_save:
                 if k in first_frame:
                     # 提取数据并存入
@@ -4830,7 +4931,7 @@ class Config:
     def __post_init__(self):
         if self.motion_plan_save_dir:
             self.motion_plan_save_dir = pathlib.Path(self.motion_plan_save_dir)
-
+        
         if not self.merge_demo_save_path:
             self.merge_demo_save_path = f"datasets/generated/{self.env_name}/merged_demos.hdf5"
 
@@ -5254,12 +5355,12 @@ def main(cfg: Config):
     # =========== [新增] 实例化课程管理器 ===========
     # 假设物体位置是 3 维 (x, y, z)
     position_guide = PositionFeasibilityGuide(object_dim=3, device='cuda' if torch.cuda.is_available() else 'cpu')
-
+    
     # 这里的 total_target_demos 应该与你命令行参数 cfg.n_demos 一致
     curriculum_manager = CurriculumManager(position_guide, total_target_demos=cfg.n_demos)
     weights_dir = pathlib.Path(f"model_weights/{cfg.env_name}")
     ckpt_path = weights_dir / "position_guide_checkpoint.pth"
-
+    
     # 如果加载成功，buffer 里就有几百条数据了，
     # CurriculumManager.get_next_position 里的 if total < warmup 判断会自动失效，
     # 从而直接跳过 Warmup 阶段！
@@ -5326,7 +5427,7 @@ def main(cfg: Config):
 
         # ============ [在此处添加显示代码] ============
         n_failures = trials - n_successes
-
+        
         # 打印带颜色的统计信息，让你一眼就能看到
         if demo["success"]:
             print(f"\n✅ [SUCCESS] Demo Generated! | Successes: {n_successes} | Failures: {n_failures} | Total: {trials}")
@@ -5472,13 +5573,13 @@ def main(cfg: Config):
     # 1. 构建保存目录
     weights_dir = pathlib.Path(f"model_weights/{cfg.env_name}")
     weights_dir.mkdir(parents=True, exist_ok=True)
-
+    
     ckpt_path = weights_dir / "position_guide_checkpoint.pth"
-
+    
     # 2. 调用保存函数 (我们需要在下面实现 save_checkpoint)
     # 这里我们不仅仅保存 model_state_dict，而是保存整个“大脑”的状态
     save_checkpoint(ckpt_path, position_guide, curriculum_manager)
-
+    
     print(f"✅ Checkpoint saved to: {ckpt_path}")
     # ============================================================
 
